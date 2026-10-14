@@ -1,0 +1,19 @@
+mode = "server"
+listen = "127.0.0.1:4433"
+log_level = "debug"
+
+[reality]
+private_key = "15f062bc123773d69fbdc0544a7de7660e78770c071dbd441adbefe7a7b6f405"
+short_id = "0123456789abcdef"
+server_name = "www.cloudflare.com"
+dest = "127.0.0.1:4443"
+cert_path = "cert.pem"
+key_path = "key.pem"
+
+[obfuscation]
+type = ""
+password = ""
+
+[quic]
+congestion = "bbr"
+block_private = true

@@ -1,0 +1,38 @@
+[package]
+name = "quic-reality"
+version = "0.4.0"
+edition = "2021"
+description = "QUIC + REALITY stealth proxy: Xray-grade authentication, real dest fallback, datagram UDP, BBR/Brutal"
+
+# Build the vendored rustls fork (carries the ClientHello session-id hook that
+# REALITY needs) instead of the crates.io release.
+[patch.crates-io]
+rustls = { path = "vendor/rustls" }
+
+[dependencies]
+anyhow = "1"
+blake2 = "0.10"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+hex = "0.4"
+quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio", "log"] }
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls", "log"] }
+rcgen = "0.13"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+webpki-roots = "0.26"
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+rand = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
