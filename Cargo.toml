@@ -2,35 +2,30 @@
 name = "quic-reality"
 version = "0.4.0"
 edition = "2021"
-description = "QUIC + REALITY stealth proxy: Xray-grade authentication, real dest fallback, datagram UDP, BBR/Brutal"
-
-# Build the vendored rustls fork (carries the ClientHello session-id hook that
-# REALITY needs) instead of the crates.io release.
-[patch.crates-io]
-rustls = { path = "vendor/rustls" }
+description = "QUIC + REALITY-style stealth proxy (authenticate inside QUIC Initial, transparent decoy fallback)"
 
 [dependencies]
 anyhow = "1"
 blake2 = "0.10"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
-futures = "0.3"
 hex = "0.4"
-quinn = { version = "0.11", default-features = false, features = ["rustls", "runtime-tokio", "log"] }
-quinn-proto = { version = "0.11", default-features = false, features = ["rustls", "log"] }
+hkdf = "0.12"
+hmac = "0.12"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "bloom"] }
+quinn-proto = { version = "0.11", default-features = false }
+rand = "0.8"
 rcgen = "0.13"
 ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pemfile = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
-socket2 = { version = "0.5", features = ["all"] }
+sha2 = "0.10"
+subtle = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-webpki-roots = "0.26"
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
-rand = "0.8"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [profile.release]
 lto = true
