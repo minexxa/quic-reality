@@ -68,7 +68,7 @@ pub fn decode_hex32(s: &str) -> Result<[u8; 32]> {
 /// Parse a short id: 0..=16 hex chars, left aligned and zero padded to 8 bytes.
 pub fn parse_short_id(s: &str) -> Result<[u8; SHORT_ID_LEN]> {
     let s = s.trim();
-    if s.len() > SHORT_ID_LEN * 2 || s.len() % 2 != 0 {
+    if s.len() > SHORT_ID_LEN * 2 || !s.len().is_multiple_of(2) {
         bail!("short_id must be an even number of hex chars, at most 16");
     }
     let bytes = hex::decode(s).context("short_id is not valid hex")?;

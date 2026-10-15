@@ -169,7 +169,7 @@ impl ServerAuth {
     fn try_auth(&self, data: &[u8], peer: SocketAddr, dcid: &[u8]) -> Result<()> {
         let init = initial::parse_client_initial(&*self.crypto, data)?;
         let sni = init.sni.ok_or_else(|| anyhow!("no SNI"))?;
-        if !self.server_names.iter().any(|n| *n == sni) {
+        if !self.server_names.contains(&sni) {
             bail!("SNI {sni} is not served");
         }
         let v = auth::verify_client_hello(

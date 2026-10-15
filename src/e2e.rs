@@ -134,7 +134,7 @@ async fn wrong_short_id_is_treated_as_a_prober() {
     let e = env(true, false).await;
     let mgr = ConnManager::new(&client_config(e.srv.local_addr, &e.pubkey, "ffffffffffffffff", false)).await.unwrap();
     let r = mgr.open(CMD_TCP, &TargetAddr::Ip("127.0.0.1:9".parse().unwrap())).await;
-    let err = format!("{:#}", r.err().expect("must fail"));
+    let err = format!("{:#}", r.expect_err("must fail"));
     // It reached the decoy, whose certificate is not a REALITY certificate.
     assert!(err.contains("REALITY") || err.contains("certificate") || err.contains("handshake"), "{err}");
 }
@@ -152,7 +152,7 @@ async fn private_targets_are_denied_by_default() {
     let e = env(false, false).await;
     let echo = tcp_echo().await;
     let mgr = ConnManager::new(&client_config(e.srv.local_addr, &e.pubkey, "0123456789abcdef", false)).await.unwrap();
-    let err = mgr.open(CMD_TCP, &TargetAddr::Ip(echo)).await.err().expect("must be denied");
+    let err = mgr.open(CMD_TCP, &TargetAddr::Ip(echo)).await.expect_err("must be denied");
     assert!(format!("{err:#}").contains("not allowed"), "{err:#}");
 }
 
