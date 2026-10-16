@@ -1,0 +1,9 @@
+mode = "client"
+server = "你的服务器IP:443"
+[reality]
+public_key = "<服务端私钥对应的公钥>"
+short_id = "0123456789abcdef"
+server_name = "www.cloudflare.com"   # 必须与服务端一致
+[local]
+socks = "127.0.0.1:1080"        # 默认值
+http  = "127.0.0.1:8080"        # 默认值
