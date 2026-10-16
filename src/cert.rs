@@ -5,11 +5,19 @@
 //! `HMAC-SHA512(auth_key, cert_public_key)`. Only a peer that derived the same
 //! `auth_key` (i.e. someone who knows the server's static private key) can
 //! produce it, so the client can authenticate the server without any CA.
+//!
+//! Ed25519 is not an accident: the HMAC is exactly 64 bytes wide, the width of
+//! an Ed25519 signature, so it drops into the X.509 signature slot without
+//! disturbing the DER length fields.  The catch is that a Chrome
+//! `signature_algorithms` list does not offer ed25519, so a stock TLS server
+//! would refuse to sign the CertificateVerify with the only algorithm this
+//! certificate's key supports; see [`ForcedEd25519`].
 
 use crate::auth;
 use anyhow::{anyhow, bail, Result};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-use rustls::sign::CertifiedKey;
+use rustls::sign::{CertifiedKey, Signer, SigningKey};
+use std::sync::Arc;
 
 /// Reads one DER TLV at `*pos`; returns (tag, content_start, content_end) and
 /// advances `*pos` past the element.
@@ -45,6 +53,34 @@ struct Layout {
 }
 
 const ED25519_ALG: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x70];
+
+/// A REALITY server never lets the client pick the CertificateVerify signature
+/// algorithm.
+///
+/// The temporary certificate is Ed25519, but the client sends a pure Chrome
+/// `signature_algorithms` list, which does not include ed25519 - a stock TLS
+/// server answers `choose_scheme` with `None` there and aborts the handshake
+/// with `no_signature_algorithms_in_common`.  xtls/reality solves the same
+/// conflict by hard-wiring `hs.sigAlg = Ed25519` in its patched crypto/tls;
+/// with a stock rustls server the equivalent is to answer `choose_scheme` as
+/// if ed25519 had been offered.  Nothing is lost: the client is ours, it
+/// verifies Ed25519 CertificateVerify messages, and a prober never sees this
+/// certificate at all.
+#[derive(Debug)]
+struct ForcedEd25519(Arc<dyn SigningKey>);
+
+impl SigningKey for ForcedEd25519 {
+    fn choose_scheme(
+        &self,
+        _offered: &[rustls::SignatureScheme],
+    ) -> Option<Box<dyn Signer>> {
+        self.0.choose_scheme(&[rustls::SignatureScheme::ED25519])
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        self.0.algorithm()
+    }
+}
 
 fn layout(der: &[u8]) -> Option<Layout> {
     let mut p = 0;
@@ -111,7 +147,20 @@ pub fn mint(auth_key: &[u8; 32], server_name: &str) -> Result<CertifiedKey> {
     let pkcs8 = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
     let signing_key = rustls::crypto::ring::sign::any_eddsa_type(&pkcs8)
         .map_err(|e| anyhow!("signing key: {e}"))?;
-    Ok(CertifiedKey::new(vec![CertificateDer::from(der)], signing_key))
+    Ok(CertifiedKey::new(
+        vec![CertificateDer::from(der)],
+        Arc::new(ForcedEd25519(signing_key)),
+    ))
+}
+
+/// The Ed25519 public key a certificate was minted with.
+///
+/// The client needs it to check the TLS `CertificateVerify` signature: the
+/// certificate authenticates itself with the HMAC, and the signature proves the
+/// server holds the matching private key.
+pub fn public_key(der: &[u8]) -> Option<[u8; 32]> {
+    let l = layout(der)?;
+    der[l.ed25519_pub.0..l.ed25519_pub.1].try_into().ok()
 }
 
 /// Client side: does this certificate carry a valid REALITY HMAC for `auth_key`?

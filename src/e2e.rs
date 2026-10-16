@@ -111,6 +111,12 @@ async fn echo_roundtrip(mgr: &ConnManager, echo: SocketAddr, payload: &[u8]) {
 
 #[tokio::test]
 async fn authenticated_client_can_proxy_tcp() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "quic_reality=debug",
+        ))
+        .with_writer(std::io::stderr)
+        .try_init();
     let e = env(true, false).await;
     let echo = tcp_echo().await;
     let mgr = ConnManager::new(&client_config(e.srv.local_addr, &e.pubkey, "0123456789abcdef", false)).await.unwrap();

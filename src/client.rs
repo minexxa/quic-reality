@@ -65,11 +65,8 @@ impl ConnManager {
 
     async fn connect(&self) -> Result<Connection> {
         let m = auth::build_client_material(&self.server_pub, &self.short_id, &self.sni, auth::now_secs())?;
-        let cfg = tls::make_client_config(m.auth_key, self.transport.clone())?;
-        // The ClientHello is produced synchronously inside connect_with.
-        let connecting = tls::with_client_material(m, || {
-            self.endpoint.connect_with(cfg, self.server_addr, &self.sni)
-        })?;
+        let cfg = tls::make_client_config(m, self.transport.clone())?;
+        let connecting = self.endpoint.connect_with(cfg, self.server_addr, &self.sni)?;
         let conn = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
             .await
             .context("handshake timed out (wrong key/short_id/server_name, or server unreachable)")??;

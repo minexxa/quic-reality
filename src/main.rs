@@ -1,5 +1,6 @@
 mod auth;
 mod cert;
+mod chrome_tls;
 mod cid;
 mod client;
 mod config;
