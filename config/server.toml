@@ -1,0 +1,9 @@
+mode = "server"
+listen = "0.0.0.0:443"          # 服务端监听
+[reality]
+private_key = "<keygen 输出的私钥>"
+short_id = "0123456789abcdef"   # ≤8 字节 hex，两端必须一致
+server_name = "www.cloudflare.com"   # 必须是 dest 真实支持 HTTP/3 的域名
+dest = "www.cloudflare.com:443"      # 诱饵：未认证流量透明转发到这里
+[security]
+allow_private_targets = false   # 默认禁止认证客户端访问内网/回环
