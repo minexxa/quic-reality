@@ -18,6 +18,9 @@ use tracing::{debug, info, warn};
 use x25519_dalek::PublicKey;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Must exceed the server's own 10 s target-connect timeout, so a live server
+/// always answers (OK or error) before the client concludes it is dead.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const UDP_ASSOC_IDLE: Duration = Duration::from_secs(120);
 
 /// Owns the single QUIC connection and transparently re-establishes it.
@@ -46,8 +49,12 @@ impl ConnManager {
             .then(|| Salamander::new(cfg.obfuscation.password.as_bytes()))
         .transpose()?;
         let socket = RealitySocket::bind(bind, salamander, None)?;
+        // quinn sets the grease-QUIC-bit transport parameter by default; browsers
+        // do not send it.
+        let mut ep_cfg = EndpointConfig::default();
+        ep_cfg.grease_quic_bit(false);
         let endpoint = Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
+            ep_cfg,
             None,
             socket,
             Arc::new(TokioRuntime),
@@ -101,38 +108,51 @@ impl ConnManager {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    /// Opens a stream, reconnecting once if the connection died.
+    /// Opens a stream.  If the connection turns out to be dead (closed, reset by
+    /// a restarted server, or silent for `OPEN_TIMEOUT`) it is dropped and the
+    /// request is retried once on a fresh connection.  Refusals from the server
+    /// (policy, unreachable target) are final and never trigger a reconnect.
     pub async fn open(&self, cmd: u8, target: &TargetAddr) -> Result<(SendStream, RecvStream)> {
         let mut last = anyhow!("unreachable");
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let conn = self.get().await?;
-            match self.open_on(&conn, cmd, target).await {
-                Ok(s) => return Ok(s),
-                Err(e) => {
-                    if conn.close_reason().is_some() {
-                        self.invalidate(conn.stable_id()).await;
-                        last = e;
-                        continue;
-                    }
-                    return Err(e);
+            match tokio::time::timeout(OPEN_TIMEOUT, self.open_on(&conn, cmd, target)).await {
+                Ok(Ok(s)) => return Ok(s),
+                Ok(Err(OpenErr::Refused(e))) => return Err(e),
+                Ok(Err(OpenErr::Conn(e))) => last = e,
+                Err(_) => {
+                    last = anyhow!("server did not answer within {}s", OPEN_TIMEOUT.as_secs())
                 }
             }
+            warn!("connection looks dead ({last:#}); reconnecting (attempt {})", attempt + 1);
+            conn.close(0u32.into(), b"reconnect");
+            self.invalidate(conn.stable_id()).await;
         }
         Err(last)
     }
 
-    async fn open_on(&self, conn: &Connection, cmd: u8, target: &TargetAddr) -> Result<(SendStream, RecvStream)> {
-        let (mut send, mut recv) = conn.open_bi().await?;
-        send.write_all(&encode_request(cmd, target)?).await?;
-        let status = tokio::time::timeout(Duration::from_secs(20), recv.read_u8())
-            .await
-            .context("server did not answer")??;
+    async fn open_on(
+        &self,
+        conn: &Connection,
+        cmd: u8,
+        target: &TargetAddr,
+    ) -> std::result::Result<(SendStream, RecvStream), OpenErr> {
+        let req = encode_request(cmd, target).map_err(OpenErr::Refused)?;
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| OpenErr::Conn(e.into()))?;
+        send.write_all(&req).await.map_err(|e| OpenErr::Conn(e.into()))?;
+        let status = recv.read_u8().await.map_err(|e| OpenErr::Conn(e.into()))?;
         match status {
             STATUS_OK => Ok((send, recv)),
-            STATUS_DENIED => bail!("target not allowed by server policy"),
-            _ => bail!("server could not reach target"),
+            STATUS_DENIED => Err(OpenErr::Refused(anyhow!("target not allowed by server policy"))),
+            _ => Err(OpenErr::Refused(anyhow!("server could not reach target"))),
         }
     }
+}
+
+/// Why opening a stream failed: the server said no, or the connection is bad.
+enum OpenErr {
+    Refused(anyhow::Error),
+    Conn(anyhow::Error),
 }
 
 pub async fn run(cfg: Config) -> Result<()> {

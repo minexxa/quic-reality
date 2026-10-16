@@ -56,16 +56,37 @@ impl ResolvesServerCert for FixedCert {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: when non-zero, the server offers only this TLS 1.3 suite.
+    pub static TEST_FORCE_SUITE: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
 fn server_crypto(ck: Option<Arc<CertifiedKey>>) -> Result<Arc<QuicServerConfig>> {
-    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
+    #[allow(unused_mut)]
+    let mut provider = rustls::crypto::ring::default_provider();
+    #[cfg(test)]
+    let forced = TEST_FORCE_SUITE.with(|c| c.get());
+    #[cfg(test)]
+    if forced != 0 {
+        // The Initial-key suite (AES-128-GCM) must stay available, so the hook
+        // reorders instead of removing: with `ignore_client_order` the server's
+        // first choice wins.
+        provider
+            .cipher_suites
+            .sort_by_key(|s| u16::from(s.suite()) != forced);
+    }
+    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_no_client_auth()
     .with_cert_resolver(Arc::new(FixedCert(ck)));
     crypto.alpn_protocols = vec![ALPN.to_vec()];
     crypto.max_early_data_size = 0;
     crypto.send_tls13_tickets = 0;
+    #[cfg(test)]
+    if forced != 0 {
+        crypto.ignore_client_order = true;
+    }
     Ok(Arc::new(
         QuicServerConfig::try_from(crypto).map_err(|e| anyhow!("quic server crypto: {e}"))?,
     ))
@@ -103,11 +124,15 @@ pub fn make_transport(q: &QuicConfig) -> Arc<TransportConfig> {
     if q.keep_alive_secs > 0 {
         t.keep_alive_interval(Some(Duration::from_secs(q.keep_alive_secs)));
     }
-    t.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
-    t.receive_window(VarInt::from_u32(32 * 1024 * 1024));
+    // Flow-control limits are advertised in the ClientHello's transport
+    // parameters, so they are set to the round numbers browsers use (6 MiB per
+    // stream, 15 MiB per connection, 100 bidirectional / 103 unidirectional
+    // streams) instead of quinn-specific values.
+    t.stream_receive_window(VarInt::from_u32(6 * 1024 * 1024));
+    t.receive_window(VarInt::from_u32(15 * 1024 * 1024));
     t.send_window(32 * 1024 * 1024);
-    t.max_concurrent_bidi_streams(VarInt::from_u32(512));
-    t.max_concurrent_uni_streams(VarInt::from_u32(16));
+    t.max_concurrent_bidi_streams(VarInt::from_u32(100));
+    t.max_concurrent_uni_streams(VarInt::from_u32(103));
     // Proxying is stream based; do not advertise the DATAGRAM extension.
     t.datagram_receive_buffer_size(None);
     match q.congestion {

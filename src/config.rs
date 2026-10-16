@@ -137,11 +137,11 @@ pub struct QuicConfig {
 }
 
 fn default_idle() -> u64 {
-    30
+    20
 }
 
 fn default_keepalive() -> u64 {
-    10
+    6
 }
 
 impl Default for QuicConfig {

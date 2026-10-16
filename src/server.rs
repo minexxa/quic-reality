@@ -60,7 +60,9 @@ pub async fn start(cfg: &Config) -> Result<Running> {
     let dest = resolve_dest(&cfg.reality.dest, &listen).await?;
 
     let base = tls::make_base_server_crypto()?;
-    let cid = HmacCid::new();
+    // Keys derived from the long-term private key survive restarts (see cid::derive_keys).
+    let (cid_key, reset_key) = crate::cid::derive_keys(&kp.private.to_bytes());
+    let cid = HmacCid::from_key(cid_key);
     let auth = ServerAuth::new(
         kp.private.clone(),
         cfg.short_ids()?,
@@ -77,7 +79,10 @@ pub async fn start(cfg: &Config) -> Result<Running> {
         .transpose()?;
     let socket = RealitySocket::bind(listen, salamander, Some(auth.clone()))?;
 
-    let mut ep_cfg = EndpointConfig::default();
+    let mut ep_cfg = EndpointConfig::new(Arc::new(ring::hmac::Key::new(
+        ring::hmac::HMAC_SHA256,
+        &reset_key,
+    )));
     let cid_for_endpoint = cid.clone();
     ep_cfg.cid_generator(move || Box::new(cid_for_endpoint.clone()));
 

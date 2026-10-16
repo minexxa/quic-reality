@@ -78,20 +78,16 @@ const HS_KEY_UPDATE: u8 = 0x18;
 const EXT_SERVER_NAME: u16 = 0x0000;
 const EXT_STATUS_REQUEST: u16 = 0x0005;
 const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
-const EXT_EC_POINT_FORMATS: u16 = 0x000b;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 const EXT_ALPN: u16 = 0x0010;
 const EXT_SCT: u16 = 0x0012;
 const EXT_PADDING: u16 = 0x0015;
-const EXT_EMS: u16 = 0x0017;
 const EXT_COMPRESS_CERTIFICATE: u16 = 0x001b;
-const EXT_SESSION_TICKET: u16 = 0x0023;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
 const EXT_PSK_MODES: u16 = 0x002d;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_QUIC_TP: u16 = 0x0039;
 const EXT_APPLICATION_SETTINGS: u16 = 0x4469;
-const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
 const EXT_ECH: u16 = 0xfe0d;
 
 const GROUP_X25519: u16 = 0x001d;
@@ -109,28 +105,16 @@ const GREASE: [u16; 16] = [
     0xcaca, 0xdada, 0xeaea, 0xfafa,
 ];
 
-/// Cipher suites Chrome 120 offers, in Chrome's order.
-///
-/// The three TLS 1.3 suites come first, then the TLS 1.2 suites Chrome still
-/// advertises.  A TLS 1.3 server picks the first entry it also supports, so
-/// in practice `0x1301` (AES-128-GCM / SHA-256) is always the result; the
-/// rest exists purely so the fingerprint matches.
-const CHROME_CIPHER_SUITES: [u16; 15] = [
+/// Cipher suites offered in the QUIC ClientHello: the three TLS 1.3 suites in
+/// BoringSSL's order.  RFC 9001 §4.2 forbids a QUIC client from offering
+/// anything older than TLS 1.3, so the TLS 1.2 / CBC / RSA suites a browser puts
+/// in its *TCP* hello are deliberately absent: a QUIC Initial that offers them
+/// matches no real QUIC client.  A TLS 1.3 server picks the first one it also
+/// supports, i.e. `0x1301`.
+const CHROME_CIPHER_SUITES: [u16; 3] = [
     0x1301, // TLS_AES_128_GCM_SHA256
     0x1302, // TLS_AES_256_GCM_SHA384
     0x1303, // TLS_CHACHA20_POLY1305_SHA256
-    0xc02b, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-    0xc02f, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-    0xc02c, // TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-    0xc030, // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-    0xcca9, // TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
-    0xcca8, // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-    0xc013, // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
-    0xc014, // TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA
-    0x009c, // TLS_RSA_WITH_AES_128_GCM_SHA256
-    0x009d, // TLS_RSA_WITH_AES_256_GCM_SHA384
-    0x002f, // TLS_RSA_WITH_AES_128_CBC_SHA
-    0x0035, // TLS_RSA_WITH_AES_256_CBC_SHA
 ];
 
 /// Signature algorithms Chrome offers.
@@ -445,6 +429,12 @@ static SUITES: [Suite; 3] = [
     },
 ];
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the TLS 1.3 suite the last handshake on this thread negotiated.
+    pub static LAST_NEGOTIATED: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
 fn suite_by_id(id: u16) -> Result<&'static Suite, TlsErr> {
     SUITES
         .iter()
@@ -582,7 +572,7 @@ impl PpKey {
             key,
             iv,
             confidentiality_limit,
-            integrity_limit: 1 << 52,
+            integrity_limit: if suite.id == 0x1303 { 1 << 36 } else { 1 << 52 },
         })
     }
 
@@ -774,11 +764,12 @@ fn keyshare_extension(grease: u16, share: &[u8; 32]) -> Vec<u8> {
 
 /// `supported_versions` (RFC 8446 §4.2.1).
 fn supported_versions(grease: u16) -> Vec<u8> {
-    let mut v = Vec::with_capacity(7);
-    v.push(6); // list length
+    // TLS 1.3 only: RFC 9001 §4.2 ("Clients MUST NOT offer TLS versions older
+    // than 1.3"). The GREASE value keeps the list shaped like BoringSSL's.
+    let mut v = Vec::with_capacity(5);
+    v.push(4); // list length
     push_u16(&mut v, grease);
     push_u16(&mut v, VERSION_TLS13);
-    push_u16(&mut v, 0x0303);
     v
 }
 
@@ -849,31 +840,36 @@ pub fn build_client_hello(
         + 1 /* compression */
         + 2; /* extension block length */
 
-    let mut exts = Vec::with_capacity(256);
-    // Chrome greases the first extension slot ...
+    // Extensions that only exist for TLS 1.2 and earlier (extended_master_secret,
+    // renegotiation_info, ec_point_formats, session_ticket) are not sent: a
+    // TLS 1.3-only QUIC client has no use for them.  BoringSSL also permutes the
+    // order of the remaining extensions on every connection (since Chrome 110),
+    // so they are shuffled here too; the greased first and last slots stay put.
+    let mut middle: Vec<(u16, Vec<u8>)> = vec![
+        (EXT_SERVER_NAME, sni_extension(sni)),
+        (EXT_SUPPORTED_GROUPS, supported_groups(g_group)),
+        (EXT_ALPN, proto_list(&[b"h3"])),
+        // status_request: an OCSP request with no responder ids / extensions.
+        (EXT_STATUS_REQUEST, vec![0x01, 0x00, 0x00, 0x00, 0x00]),
+        (EXT_SIGNATURE_ALGORITHMS, sigalgs_extension()),
+        (EXT_SCT, Vec::new()),
+        (EXT_KEY_SHARE, keyshare_extension(g_group, key_share)),
+        (EXT_PSK_MODES, vec![0x01, 0x01]),
+        (EXT_SUPPORTED_VERSIONS, supported_versions(g_version)),
+        (EXT_QUIC_TP, quic_params.to_vec()),
+        (EXT_COMPRESS_CERTIFICATE, vec![0x02, 0x00, 0x02]),
+        (EXT_APPLICATION_SETTINGS, proto_list(&[b"h3"])),
+        (EXT_ECH, grease_ech(&mut rng)),
+    ];
+    {
+        use rand::seq::SliceRandom;
+        middle.shuffle(&mut rng);
+    }
+    let mut exts = Vec::with_capacity(512);
     push_ext(&mut exts, g_ext1, &[]);
-    push_ext(&mut exts, EXT_SERVER_NAME, &sni_extension(sni));
-    push_ext(&mut exts, EXT_EMS, &[]);
-    push_ext(&mut exts, EXT_RENEGOTIATION_INFO, &[0x00]);
-    push_ext(&mut exts, EXT_SUPPORTED_GROUPS, &supported_groups(g_group));
-    push_ext(&mut exts, EXT_EC_POINT_FORMATS, &[0x01, 0x00]);
-    push_ext(&mut exts, EXT_SESSION_TICKET, &[]);
-    // ... ALPN is "h3", not the TCP list ...
-    push_ext(&mut exts, EXT_ALPN, &proto_list(&[b"h3"]));
-    // status_request: an OCSP request with an empty responder id list and no
-    // extensions (RFC 6066 §8) - the five bytes Chrome always sends.
-    push_ext(&mut exts, EXT_STATUS_REQUEST, &[0x01, 0x00, 0x00, 0x00, 0x00]);
-    push_ext(&mut exts, EXT_SIGNATURE_ALGORITHMS, &sigalgs_extension());
-    push_ext(&mut exts, EXT_SCT, &[]);
-    push_ext(&mut exts, EXT_KEY_SHARE, &keyshare_extension(g_group, key_share));
-    push_ext(&mut exts, EXT_PSK_MODES, &[0x01, 0x01]);
-    push_ext(&mut exts, EXT_SUPPORTED_VERSIONS, &supported_versions(g_version));
-    // ... the QUIC layer tacks its transport parameters on here ...
-    push_ext(&mut exts, EXT_QUIC_TP, quic_params);
-    push_ext(&mut exts, EXT_COMPRESS_CERTIFICATE, &[0x02, 0x00, 0x02]);
-    // ... and ALPS carries "h3" too.
-    push_ext(&mut exts, EXT_APPLICATION_SETTINGS, &proto_list(&[b"h3"]));
-    push_ext(&mut exts, EXT_ECH, &grease_ech(&mut rng));
+    for (ty, data) in &middle {
+        push_ext(&mut exts, *ty, data);
+    }
     push_ext(&mut exts, g_ext2, &[0x00]);
 
     // ... and finally the hello is padded back up to a constant size.
@@ -988,7 +984,10 @@ impl ChromeSession {
             (State::AwaitFinished, HS_FINISHED) => self.on_finished(&msg[4..], before),
             // NewSessionTicket / KeyUpdate.  A REALITY client never resumes and
             // quinn drives key updates itself, so there is nothing to do.
-            (State::Done, HS_SESSION_TICKET | HS_KEY_UPDATE) => Ok(()),
+            (State::Done, HS_SESSION_TICKET) => Ok(()),
+            // RFC 9001 §6: a TLS KeyUpdate in QUIC is a connection error; QUIC
+            // has its own key update mechanism.
+            (State::Done, HS_KEY_UPDATE) => Err(TlsErr::bad("TLS KeyUpdate is not allowed in QUIC")),
             _ => Err(TlsErr::bad("unexpected handshake message")),
         }
     }
@@ -1013,6 +1012,8 @@ impl ChromeSession {
 
         let suite = suite_by_id(suite_id)?;
         self.alg = suite.alg;
+        #[cfg(test)]
+        LAST_NEGOTIATED.with(|c| c.set(suite_id));
         self.suite = Some(suite);
 
         // supported_versions and key_share are mandatory in a TLS 1.3 ServerHello.
@@ -1404,6 +1405,41 @@ impl QuicSessionTrait for ChromeSession {
     }
 }
 
+/// Removes parameters that single quinn out from the encoded transport
+/// parameters: `min_ack_delay` (draft ack-frequency, id 0xff04de1b), which quinn
+/// advertises unconditionally and browsers do not send.  Unparseable input is
+/// returned unchanged rather than guessed at.
+fn sanitize_transport_params(raw: &[u8]) -> Vec<u8> {
+    fn varint(b: &[u8], o: &mut usize) -> Option<u64> {
+        let first = *b.get(*o)?;
+        let len = 1usize << (first >> 6);
+        let bytes = b.get(*o..*o + len)?;
+        let mut v = (first & 0x3f) as u64;
+        for x in &bytes[1..] {
+            v = (v << 8) | *x as u64;
+        }
+        *o += len;
+        Some(v)
+    }
+    const MIN_ACK_DELAY: u64 = 0xff04_de1b;
+    let mut out = Vec::with_capacity(raw.len());
+    let mut o = 0;
+    while o < raw.len() {
+        let start = o;
+        let (Some(id), Some(len)) = (varint(raw, &mut o), varint(raw, &mut o)) else {
+            return raw.to_vec();
+        };
+        let Some(end) = o.checked_add(len as usize).filter(|e| *e <= raw.len()) else {
+            return raw.to_vec();
+        };
+        o = end;
+        if id != MIN_ACK_DELAY {
+            out.extend_from_slice(&raw[start..end]);
+        }
+    }
+    out
+}
+
 /// quinn client crypto configuration that emits a Chrome ClientHello.
 pub struct ChromeClientConfig {
     priv_key: [u8; 32],
@@ -1468,9 +1504,114 @@ impl CryptoClientConfig for ChromeClientConfig {
         }
         let mut quic_params = Vec::new();
         params.write(&mut quic_params);
+        let quic_params = sanitize_transport_params(&quic_params);
         let hello = build_client_hello(server_name, &self.random, &self.pub_key, &quic_params);
         let mut tx = VecDeque::new();
         tx.push_back((false, hello));
         Ok(Box::new(self.make_session(tx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_grease(x: u16) -> bool {
+        (x & 0x0f0f) == 0x0a0a && (x >> 8) == (x & 0xff)
+    }
+
+    /// (cipher suites, extension types in wire order, supported_versions list)
+    fn dissect(hello: &[u8]) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let body = &hello[4..];
+        let mut o = 2 + 32;
+        o += 1 + body[o] as usize; // session id
+        let cl = u16::from_be_bytes([body[o], body[o + 1]]) as usize;
+        o += 2;
+        let suites = (0..cl / 2)
+            .map(|i| u16::from_be_bytes([body[o + 2 * i], body[o + 2 * i + 1]]))
+            .collect();
+        o += cl;
+        o += 1 + body[o] as usize; // compression
+        let el = u16::from_be_bytes([body[o], body[o + 1]]) as usize;
+        o += 2;
+        let exts = &body[o..o + el];
+        let (mut types, mut versions, mut p) = (Vec::new(), Vec::new(), 0);
+        while p < exts.len() {
+            let t = u16::from_be_bytes([exts[p], exts[p + 1]]);
+            let l = u16::from_be_bytes([exts[p + 2], exts[p + 3]]) as usize;
+            if t == EXT_SUPPORTED_VERSIONS {
+                let d = &exts[p + 4..p + 4 + l];
+                versions = (0..d[0] as usize / 2)
+                    .map(|i| u16::from_be_bytes([d[1 + 2 * i], d[2 + 2 * i]]))
+                    .collect();
+            }
+            types.push(t);
+            p += 4 + l;
+        }
+        (suites, types, versions)
+    }
+
+    #[test]
+    fn initial_secrets_match_rfc9001_appendix_a() {
+        // RFC 9001 A.1: client Initial keys for DCID 0x8394c8f03e515708.
+        let dcid = hex::decode("8394c8f03e515708").unwrap();
+        let early = HashAlg::Sha256.extract(&INITIAL_SALT_V1, &dcid);
+        let client = early.expand_label(b"client in", &[], 32);
+        assert_eq!(
+            hex::encode(&client),
+            "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"
+        );
+        let prk = HashAlg::Sha256.prk(&client).unwrap();
+        assert_eq!(hex::encode(prk.expand_label(b"quic key", &[], 16)), "1f369613dd76d5467730efcbe3b1a22d");
+        assert_eq!(hex::encode(prk.expand_label(b"quic iv", &[], 12)), "fa044b2f42a3fd3b46fb255c");
+        assert_eq!(hex::encode(prk.expand_label(b"quic hp", &[], 16)), "9f50449e04a0e810283a1e9933adedd2");
+    }
+
+    #[test]
+    fn hello_is_tls13_only_shuffled_and_parseable() {
+        let (random, share) = ([7u8; 32], [9u8; 32]);
+        let mut orders = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let h = build_client_hello("www.example.com", &random, &share, &[0x01, 0x01, 0x05]);
+            let (suites, types, versions) = dissect(&h);
+
+            let real: Vec<u16> = suites.iter().copied().filter(|s| !is_grease(*s)).collect();
+            assert_eq!(real, CHROME_CIPHER_SUITES.to_vec(), "only TLS 1.3 suites");
+            assert!(is_grease(suites[0]));
+            assert_eq!(versions.len(), 2);
+            assert!(is_grease(versions[0]) && versions[1] == VERSION_TLS13, "TLS 1.3 only: {versions:x?}");
+
+            for legacy in [0x0017u16, 0xff01, 0x000b, 0x0023] {
+                assert!(!types.contains(&legacy), "TLS<=1.2 extension {legacy:#x} must not be sent");
+            }
+            // A short hello gets a padding extension *after* the trailing GREASE
+            // slot (as in browsers); ignore it when checking the greased frame.
+            let core: Vec<u16> = types.iter().copied().filter(|t| *t != 0x0015).collect();
+            assert!(is_grease(core[0]) && is_grease(*core.last().unwrap()), "greased first/last: {core:x?}");
+            assert_ne!(core[0], *core.last().unwrap(), "the two GREASE slots differ");
+            let mut sorted = types.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), types.len(), "no duplicate extensions");
+            orders.insert(types);
+
+            // the server-side parser must still extract everything it needs
+            let ci = crate::initial::parse_client_hello(&h).unwrap();
+            assert_eq!((ci.random, ci.key_share), (random, share));
+            assert_eq!(ci.sni.as_deref(), Some("www.example.com"));
+        }
+        assert!(orders.len() > 1, "extension order must vary between connections");
+    }
+
+    #[test]
+    fn min_ack_delay_is_stripped_and_garbage_is_left_alone() {
+        // id 0x01 len 1 | id 0xff04de1b (> 2^30, so an 8-byte varint) len 2 | id 0x04 len 1
+        let mut v = vec![0x01, 0x01, 0x05];
+        v.extend_from_slice(&[0xc0, 0, 0, 0, 0xff, 0x04, 0xde, 0x1b, 0x02, 0x47, 0xd0]);
+        v.extend_from_slice(&[0x04, 0x01, 0x09]);
+        assert_eq!(sanitize_transport_params(&v), vec![0x01, 0x01, 0x05, 0x04, 0x01, 0x09]);
+        let truncated = &v[..v.len() - 1];
+        assert_eq!(sanitize_transport_params(truncated), truncated.to_vec());
+        assert_eq!(sanitize_transport_params(&[]), Vec::<u8>::new());
     }
 }

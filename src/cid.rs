@@ -27,9 +27,16 @@ pub struct HmacCid {
 }
 
 impl HmacCid {
+    #[cfg(test)]
     pub fn new() -> Self {
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
+        Self { key: Arc::new(key) }
+    }
+
+    /// CID key derived from a long-term secret, so connection IDs stay valid
+    /// across server restarts (see `derive_keys`).
+    pub fn from_key(key: [u8; 32]) -> Self {
         Self { key: Arc::new(key) }
     }
 
@@ -75,9 +82,43 @@ impl ConnectionIdGenerator for HmacCid {
     }
 }
 
+/// Derives the CID-MAC key and the stateless-reset key from the server's
+/// long-term private key.
+///
+/// Why: with random per-process keys a restarted server no longer recognises the
+/// CIDs of connections that were open before the restart, so it forwards the
+/// clients' packets to the decoy and the clients only notice after their idle
+/// timeout.  With stable keys the restarted server accepts those packets (the
+/// CID MAC still verifies), has no such connection, and answers with a
+/// *stateless reset* whose token the client already holds, so the client drops
+/// the dead connection and reconnects immediately.
+pub fn derive_keys(server_private: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    use hkdf::Hkdf;
+    let hk = Hkdf::<Sha256>::new(Some(b"quic-reality persistent keys v1"), server_private);
+    let mut cid = [0u8; 32];
+    let mut reset = [0u8; 32];
+    hk.expand(b"cid mac key", &mut cid).expect("32 bytes");
+    hk.expand(b"stateless reset key", &mut reset).expect("32 bytes");
+    (cid, reset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derived_keys_are_stable_distinct_and_secret_dependent() {
+        let (c1, r1) = derive_keys(&[1u8; 32]);
+        let (c2, r2) = derive_keys(&[1u8; 32]);
+        let (c3, _) = derive_keys(&[2u8; 32]);
+        assert_eq!((c1, r1), (c2, r2));
+        assert_ne!(c1, r1);
+        assert_ne!(c1, c3);
+        // a CID minted before a "restart" still validates after it
+        let mut before = HmacCid::from_key(c1);
+        let cid = before.generate_cid();
+        assert!(HmacCid::from_key(c2).is_valid(&cid));
+    }
 
     #[test]
     fn minted_cids_validate_and_foreign_ones_do_not() {

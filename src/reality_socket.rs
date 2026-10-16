@@ -130,6 +130,26 @@ impl ServerAuth {
         self.lookup(peer, dcid).is_some()
     }
 
+    /// What happens to traffic we cannot vouch for.
+    pub fn fallback_verdict(&self) -> Verdict {
+        if self.dest.is_some() {
+            Verdict::Relay
+        } else {
+            Verdict::Drop
+        }
+    }
+
+    /// `classify`, but a bug in any parser can never take the socket down: this
+    /// runs inside quinn's endpoint driver task, so an uncaught panic would stop
+    /// the whole server from receiving anything.
+    pub fn classify_guarded(&self, data: &[u8], peer: SocketAddr) -> Verdict {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.classify(data, peer)))
+            .unwrap_or_else(|_| {
+                warn!("panic while classifying a datagram from {peer}; treating it as unauthenticated");
+                self.fallback_verdict()
+            })
+    }
+
     pub fn classify(&self, data: &[u8], peer: SocketAddr) -> Verdict {
         let fallback = if self.dest.is_some() {
             Verdict::Relay
@@ -400,7 +420,7 @@ impl AsyncUdpSocket for RealitySocket {
                             (Some(_), None) => &[],
                             (None, _) => &bufs[i][..len.min(stride)],
                         };
-                        match srv.classify(view, m.addr) {
+                        match srv.classify_guarded(view, m.addr) {
                             Verdict::Pass => true,
                             Verdict::Relay => {
                                 srv.relay(m.addr, &bufs[i][..len], stride);

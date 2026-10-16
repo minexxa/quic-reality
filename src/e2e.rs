@@ -229,3 +229,108 @@ async fn replayed_client_hello_is_relayed_not_accepted() {
     assert_eq!(a.classify(&[0u8; 5], other), Verdict::Relay);
     let _ = auth::now_secs();
 }
+
+
+/// The hand-written key schedule must work for every TLS 1.3 suite it offers
+/// (SHA-256, SHA-384 and ChaCha20-Poly1305 take different code paths).
+#[tokio::test]
+async fn every_offered_tls13_suite_completes_a_handshake() {
+    use crate::chrome_tls::LAST_NEGOTIATED;
+    use crate::tls::TEST_FORCE_SUITE;
+    for suite in [0x1301u16, 0x1302, 0x1303] {
+        TEST_FORCE_SUITE.with(|c| c.set(suite));
+        LAST_NEGOTIATED.with(|c| c.set(0));
+        let e = env(true, false).await;
+        let echo = tcp_echo().await;
+        let mgr = ConnManager::new(&client_config(e.srv.local_addr, &e.pubkey, "0123456789abcdef", false))
+            .await
+            .unwrap();
+        echo_roundtrip(&mgr, echo, format!("suite {suite:#06x}").as_bytes()).await;
+        let big: Vec<u8> = (0..500_000u32).map(|i| (i % 253) as u8).collect();
+        echo_roundtrip(&mgr, echo, &big).await;
+        assert_eq!(LAST_NEGOTIATED.with(|c| c.get()), suite, "server was forced to {suite:#06x}");
+    }
+    TEST_FORCE_SUITE.with(|c| c.set(0));
+}
+
+struct ServerProc {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ServerProc {
+    /// Kill the server abruptly: its runtime and socket vanish, no CONNECTION_CLOSE is sent.
+    fn crash(mut self) {
+        let _ = self.stop.send(());
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+fn spawn_server(cfg: Config) -> Result<(ServerProc, SocketAddr), String> {
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        match rt.block_on(server::start(&cfg)) {
+            Ok(r) => {
+                let _ = addr_tx.send(Ok(r.local_addr));
+                drop(r);
+                let _ = stop_rx.recv();
+                rt.shutdown_background();
+            }
+            Err(e) => {
+                let _ = addr_tx.send(Err(e.to_string()));
+            }
+        }
+    });
+    let addr = addr_rx.recv().unwrap()?;
+    Ok((ServerProc { stop: stop_tx, thread: Some(thread) }, addr))
+}
+
+/// A crashed-and-restarted server (same key, same port) must not leave clients
+/// hanging for their idle timeout: the restarted server recognises the old
+/// connection IDs and answers with a stateless reset, so the client reconnects at once.
+#[tokio::test]
+async fn client_recovers_quickly_after_a_server_crash_and_restart() {
+    let decoy = decoy();
+    let kp = KeyPair::generate();
+    let port = {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.local_addr().unwrap().port()
+    };
+    let mk = || {
+        let mut c = server_config(decoy.addr, &kp.private_hex(), true, false);
+        c.listen = format!("127.0.0.1:{port}");
+        c
+    };
+    let (proc_a, addr) = spawn_server(mk()).unwrap();
+    let echo = tcp_echo().await;
+    let mgr = ConnManager::new(&client_config(addr, &kp.public_hex(), "0123456789abcdef", false)).await.unwrap();
+    echo_roundtrip(&mgr, echo, b"before the crash").await;
+
+    proc_a.crash();
+    let mut restarted = None;
+    for _ in 0..40 {
+        match spawn_server(mk()) {
+            Ok(p) => {
+                restarted = Some(p);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    let _proc_b = restarted.expect("the port must become free again");
+
+    let t0 = std::time::Instant::now();
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(20), mgr.open(CMD_TCP, &TargetAddr::Ip(echo)))
+        .await
+        .expect("request must not hang")
+        .expect("request must succeed on a fresh connection");
+    send.write_all(b"after the restart").await.unwrap();
+    let mut got = [0u8; 17];
+    recv.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"after the restart");
+    let took = t0.elapsed();
+    println!("recovery after crash+restart took {took:?}");
+    assert!(took < Duration::from_secs(5), "recovery took {took:?}; the stateless reset path is not working");
+}
