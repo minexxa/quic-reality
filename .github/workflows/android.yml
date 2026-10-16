@@ -66,11 +66,11 @@ jobs:
 
       - run: |
           mkdir -p dist
-          cp target/aarch64-linux-android/release/spectre dist/spectre-android-arm64
+          cp target/aarch64-linux-android/release/quic-reality dist/quic-reality-android-arm64
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ci
           prerelease: false
-          files: dist/spectre-*
+          files: dist/*
