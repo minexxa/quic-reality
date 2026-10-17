@@ -7,3 +7,8 @@ server_name = "www.cloudflare.com"   # 必须与服务端一致
 [local]
 socks = "127.0.0.1:1080"        # 默认值
 http  = "127.0.0.1:8080"        # 默认值
+[quic]
+congestion = "bbr"              # bbr / cubic / newreno / brutal
+# hy2 的 brutal 拥塞控制：按固定带宽发送，不做 BBR 式探测。需要填带宽：
+# congestion = "brutal"
+# brutal_bandwidth = "100 Mbps"   # 支持 "512 kbps" / "1gbps" 等写法，或直接写字节/秒的整数
