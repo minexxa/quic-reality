@@ -71,7 +71,7 @@ impl ConnManager {
     }
 
     async fn connect(&self) -> Result<Connection> {
-        let m = auth::build_client_material(&self.server_pub, &self.short_id, &self.sni, auth::now_secs())?;
+        let m = auth::client_material(&self.server_pub, &self.short_id, auth::now_secs())?;
         let cfg = tls::make_client_config(m, self.transport.clone())?;
         let connecting = self.endpoint.connect_with(cfg, self.server_addr, &self.sni)?;
         let conn = tokio::time::timeout(CONNECT_TIMEOUT, connecting)

@@ -2,7 +2,7 @@ use crate::auth::KeyPair;
 use crate::cid::HmacCid;
 use crate::config::Config;
 use crate::protocol::*;
-use crate::reality_socket::{RealitySocket, ServerAuth};
+use crate::reality_socket::{RealitySocket, RelayLimits, ServerAuth};
 use crate::salamander::Salamander;
 use crate::tls;
 use crate::util::{is_public_ip, relay_tcp_quic};
@@ -71,6 +71,10 @@ pub async fn start(cfg: &Config) -> Result<Running> {
         base.clone(),
         cid.clone(),
         dest,
+        RelayLimits {
+            upload: Some(cfg.reality.limit_fallback_upload),
+            download: Some(cfg.reality.limit_fallback_download),
+        },
     );
     let salamander = cfg
         .obfuscation
@@ -143,9 +147,9 @@ async fn handle_incoming(
         incoming.refuse();
         bail!("no authentication record for {peer}");
     };
-    let cfg = tls::make_conn_server_config(&pa.auth_key, &pa.server_name, transport)?;
+    let cfg = tls::make_conn_server_config(&pa.auth_key, transport)?;
     let conn = incoming.accept_with(Arc::new(cfg))?.await?;
-    info!("client connected from {peer}");
+    info!("client connected from {peer} (sni {})", pa.server_name);
 
     loop {
         let (send, recv) = match conn.accept_bi().await {

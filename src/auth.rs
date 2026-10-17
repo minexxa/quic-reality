@@ -10,8 +10,13 @@
 //! * `K = X25519(e, S)` where `S` is the server's static public key
 //!   (only the client and the server can compute it);
 //! * the ClientHello `random` (32 bytes) is an AES-256-GCM ciphertext+tag of
-//!   `version | reserved | timestamp | short_id`, keyed from `K`, with the
-//!   `key_share` and SNI as associated data. It is indistinguishable from random.
+//!   `version | reserved | timestamp | short_id`, keyed from `K`. The whole
+//!   ClientHello is the associated data - with the `random` field itself zeroed
+//!   while the tag is computed, because the ciphertext is what sits there (the
+//!   same chicken-and-egg trick xtls/reality uses for `session_id`). Every
+//!   byte of the hello - cipher suites, extensions, GREASE, the SNI, the very
+//!   key share - is therefore authenticated, and the ciphertext is
+//!   indistinguishable from random.
 //!
 //! The server proves it also knows `K` by signing its throw-away Ed25519
 //! certificate with `HMAC-SHA512(auth_key, cert_public_key)` (Xray's trick), which
@@ -29,7 +34,26 @@ use x25519_dalek::{PublicKey, StaticSecret};
 pub const PROTO_VERSION: u8 = 1;
 pub const SHORT_ID_LEN: usize = 8;
 const HKDF_INFO: &[u8] = b"quic-reality v1";
-const AAD_LABEL: &[u8] = b"qr1";
+
+/// TLS handshake message type of a ClientHello.
+const HS_CLIENT_HELLO: u8 = 0x01;
+
+/// Offset of the `random` field inside a ClientHello handshake message:
+/// the handshake header (4 bytes) plus `legacy_version` (2 bytes).
+pub const HELLO_RANDOM_OFFSET: usize = 6;
+
+/// A copy of `hello` with the `random` field zeroed: the associated data both
+/// sides use while computing the AEAD tag. The proof rides in `random`, so it
+/// cannot authenticate itself; everything else in the hello can and does.
+pub fn hello_with_zeroed_random(hello: &[u8]) -> Option<Vec<u8>> {
+    let end = HELLO_RANDOM_OFFSET + 32;
+    if hello.len() < end || hello[0] != HS_CLIENT_HELLO {
+        return None;
+    }
+    let mut h = hello.to_vec();
+    h[HELLO_RANDOM_OFFSET..end].fill(0);
+    Some(h)
+}
 
 #[derive(Clone)]
 pub struct KeyPair {
@@ -99,34 +123,64 @@ fn derive(dh: &[u8; 32], eph_pub: &[u8; 32]) -> SessionKeys {
     k
 }
 
-fn aad(eph_pub: &[u8; 32], sni: &str) -> Vec<u8> {
-    let mut a = Vec::with_capacity(AAD_LABEL.len() + 32 + sni.len());
-    a.extend_from_slice(AAD_LABEL);
-    a.extend_from_slice(eph_pub);
-    a.extend_from_slice(sni.to_ascii_lowercase().as_bytes());
-    a
-}
-
 fn aead_key(k: &[u8; 32]) -> Result<LessSafeKey> {
     Ok(LessSafeKey::new(
         UnboundKey::new(&AES_256_GCM, k).map_err(|_| anyhow!("bad aead key"))?,
     ))
 }
 
-/// Everything the client needs to build one authenticated ClientHello.
+/// Client side, phase one: the ephemeral X25519 key pair and everything derived
+/// from it. Cheap, and independent of the ClientHello that is about to be
+/// built - the proof is sealed afterwards, against the finished hello.
 pub struct ClientMaterial {
     pub secret: StaticSecret,
     pub public: [u8; 32],
-    /// Value to place in the ClientHello `random` field.
-    pub random: [u8; 32],
-    /// Used to verify the server's temporary certificate.
-    pub auth_key: [u8; 32],
+    /// Sealed into the proof at phase two.
+    short_id: [u8; SHORT_ID_LEN],
+    now_secs: u64,
+    keys: SessionKeys,
 }
 
-pub fn build_client_material(
+impl ClientMaterial {
+    /// The key the server proves possession of by signing its temporary
+    /// certificate with `HMAC-SHA512(auth_key, cert_public_key)`.
+    pub fn auth_key(&self) -> [u8; 32] {
+        self.keys.auth_key
+    }
+
+    /// Client side, phase two: seal the proof for a ClientHello that already
+    /// carries `public` in its key_share and an all-zero `random`. The AAD is
+    /// the entire hello, so tampering with any byte of it - the cipher suites,
+    /// the extensions, the SNI, the key share - invalidates the proof.
+    pub fn seal_proof(&self, hello: &[u8]) -> Result<[u8; 32]> {
+        let end = HELLO_RANDOM_OFFSET + 32;
+        if hello.len() < end || hello[0] != HS_CLIENT_HELLO {
+            bail!("not a ClientHello");
+        }
+        if hello[HELLO_RANDOM_OFFSET..end].iter().any(|&b| b != 0) {
+            bail!("the random field must be zero while the proof is sealed");
+        }
+        let mut plain = [0u8; 16];
+        plain[0] = PROTO_VERSION;
+        plain[4..8].copy_from_slice(&(self.now_secs as u32).to_be_bytes());
+        plain[8..16].copy_from_slice(&self.short_id);
+
+        let mut buf = plain.to_vec();
+        aead_key(&self.keys.seal_key)?
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(self.keys.nonce),
+                Aad::from(hello),
+                &mut buf,
+            )
+            .map_err(|_| anyhow!("seal failed"))?;
+        <[u8; 32]>::try_from(buf.as_slice()).map_err(|_| anyhow!("unexpected length"))
+    }
+}
+
+/// Phase one of the client handshake: generate the ephemeral key pair.
+pub fn client_material(
     server_pub: &PublicKey,
     short_id: &[u8; SHORT_ID_LEN],
-    sni: &str,
     now_secs: u64,
 ) -> Result<ClientMaterial> {
     let secret = StaticSecret::random_from_rng(rand::thread_rng());
@@ -135,28 +189,12 @@ pub fn build_client_material(
     if !shared.was_contributory() {
         bail!("server public key is a low-order point");
     }
-    let keys = derive(shared.as_bytes(), &public);
-
-    let mut plain = [0u8; 16];
-    plain[0] = PROTO_VERSION;
-    plain[4..8].copy_from_slice(&(now_secs as u32).to_be_bytes());
-    plain[8..16].copy_from_slice(short_id);
-
-    let mut buf = plain.to_vec();
-    aead_key(&keys.seal_key)?
-        .seal_in_place_append_tag(
-            Nonce::assume_unique_for_key(keys.nonce),
-            Aad::from(aad(&public, sni)),
-            &mut buf,
-        )
-        .map_err(|_| anyhow!("seal failed"))?;
-    let random = <[u8; 32]>::try_from(buf.as_slice()).map_err(|_| anyhow!("unexpected length"))?;
-
     Ok(ClientMaterial {
         secret,
         public,
-        random,
-        auth_key: keys.auth_key,
+        short_id: *short_id,
+        now_secs,
+        keys: derive(shared.as_bytes(), &public),
     })
 }
 
@@ -166,13 +204,15 @@ pub struct Verified {
     pub auth_key: [u8; 32],
 }
 
+/// Server side: open the proof in `random` and check it against `hello`, the
+/// complete ClientHello it arrived in (its `random` field is zeroed internally).
 pub fn verify_client_hello(
     server_secret: &StaticSecret,
     short_ids: &[[u8; SHORT_ID_LEN]],
     max_skew_secs: u64,
     random: &[u8; 32],
     eph_pub: &[u8; 32],
-    sni: &str,
+    hello: &[u8],
     now_secs: u64,
 ) -> Result<Verified> {
     let shared = server_secret.diffie_hellman(&PublicKey::from(*eph_pub));
@@ -181,11 +221,12 @@ pub fn verify_client_hello(
     }
     let keys = derive(shared.as_bytes(), eph_pub);
 
+    let aad = hello_with_zeroed_random(hello).ok_or_else(|| anyhow!("malformed ClientHello"))?;
     let mut buf = random.to_vec();
     let plain = aead_key(&keys.seal_key)?
         .open_in_place(
             Nonce::assume_unique_for_key(keys.nonce),
-            Aad::from(aad(eph_pub, sni)),
+            Aad::from(aad),
             &mut buf,
         )
         .map_err(|_| anyhow!("AEAD open failed"))?;
@@ -245,22 +286,36 @@ mod tests {
         (KeyPair::generate(), parse_short_id("0123456789abcdef").unwrap())
     }
 
+    const PARAMS: &[u8] = &[0x01, 0x01, 0x05];
+
+    /// A Chrome hello for `m` with the proof sealed in: exactly the bytes a
+    /// client would put on the wire.
+    fn wire(m: &ClientMaterial, sni: &str) -> (Vec<u8>, [u8; 32]) {
+        let mut hello =
+            crate::chrome_tls::build_client_hello(sni, &[0u8; 32], &m.public, PARAMS);
+        let random = m.seal_proof(&hello).unwrap();
+        hello[HELLO_RANDOM_OFFSET..HELLO_RANDOM_OFFSET + 32].copy_from_slice(&random);
+        (hello, random)
+    }
+
     #[test]
     fn roundtrip_and_shared_auth_key() {
         let (kp, sid) = setup();
         let now = 1_700_000_000;
-        let m = build_client_material(&kp.public, &sid, "www.example.com", now).unwrap();
-        let v = verify_client_hello(&kp.private, &[sid], 60, &m.random, &m.public, "www.example.com", now + 5)
+        let m = client_material(&kp.public, &sid, now).unwrap();
+        let (hello, random) = wire(&m, "www.example.com");
+        let v = verify_client_hello(&kp.private, &[sid], 60, &random, &m.public, &hello, now + 5)
             .unwrap();
-        assert_eq!(v.auth_key, m.auth_key);
+        assert_eq!(v.auth_key, m.auth_key());
     }
 
     #[test]
     fn rejects_wrong_server_key() {
         let (kp, sid) = setup();
         let other = KeyPair::generate();
-        let m = build_client_material(&kp.public, &sid, "a.example", 1000).unwrap();
-        assert!(verify_client_hello(&other.private, &[sid], 60, &m.random, &m.public, "a.example", 1000).is_err());
+        let m = client_material(&kp.public, &sid, 1000).unwrap();
+        let (hello, random) = wire(&m, "a.example");
+        assert!(verify_client_hello(&other.private, &[sid], 60, &random, &m.public, &hello, 1000).is_err());
     }
 
     #[test]
@@ -268,30 +323,67 @@ mod tests {
         // The attacker knows the server public key but not the short id.
         let (kp, sid) = setup();
         let bad = parse_short_id("ffffffffffffffff").unwrap();
-        let m = build_client_material(&kp.public, &bad, "a.example", 1000).unwrap();
-        assert!(verify_client_hello(&kp.private, &[sid], 60, &m.random, &m.public, "a.example", 1000).is_err());
+        let m = client_material(&kp.public, &bad, 1000).unwrap();
+        let (hello, random) = wire(&m, "a.example");
+        assert!(verify_client_hello(&kp.private, &[sid], 60, &random, &m.public, &hello, 1000).is_err());
     }
 
     #[test]
     fn rejects_stale_timestamp_wrong_sni_and_tampering() {
         let (kp, sid) = setup();
-        let m = build_client_material(&kp.public, &sid, "a.example", 1000).unwrap();
-        assert!(verify_client_hello(&kp.private, &[sid], 60, &m.random, &m.public, "a.example", 2000).is_err());
-        assert!(verify_client_hello(&kp.private, &[sid], 60, &m.random, &m.public, "b.example", 1000).is_err());
-        let mut r = m.random;
+        let now = 1_700_000_000;
+        let m = client_material(&kp.public, &sid, now).unwrap();
+        let (hello, random) = wire(&m, "a.example");
+        assert!(verify_client_hello(&kp.private, &[sid], 60, &random, &m.public, &hello, now + 1000).is_err());
+        // The same proof presented with a hello built for a different SNI:
+        // the AAD no longer matches.
+        let (other, _) = wire(&m, "b.example");
+        assert!(verify_client_hello(&kp.private, &[sid], 60, &random, &m.public, &other, now).is_err());
+        let mut r = random;
         r[0] ^= 1;
-        assert!(verify_client_hello(&kp.private, &[sid], 60, &r, &m.public, "a.example", 1000).is_err());
+        assert!(verify_client_hello(&kp.private, &[sid], 60, &r, &m.public, &hello, now).is_err());
         let mut e = m.public;
         e[0] ^= 1;
-        assert!(verify_client_hello(&kp.private, &[sid], 60, &m.random, &e, "a.example", 1000).is_err());
+        assert!(verify_client_hello(&kp.private, &[sid], 60, &random, &e, &hello, now).is_err());
+    }
+
+    #[test]
+    fn every_hello_byte_outside_random_is_authenticated() {
+        let (kp, sid) = setup();
+        let now = 1_700_000_000;
+        let m = client_material(&kp.public, &sid, now).unwrap();
+        let (hello, random) = wire(&m, "www.example.com");
+        let end = HELLO_RANDOM_OFFSET + 32;
+        for i in (0..hello.len()).filter(|i| !(*i >= HELLO_RANDOM_OFFSET && *i < end)) {
+            let mut bad = hello.clone();
+            bad[i] ^= 0x01;
+            assert!(
+                verify_client_hello(&kp.private, &[sid], 60, &random, &m.public, &bad, now)
+                    .is_err(),
+                "hello byte {i} is not covered by the AEAD tag"
+            );
+        }
+    }
+
+    #[test]
+    fn sealing_requires_a_zeroed_random() {
+        let (kp, sid) = setup();
+        let m = client_material(&kp.public, &sid, 1000).unwrap();
+        let mut hello =
+            crate::chrome_tls::build_client_hello("a.example", &[0u8; 32], &m.public, PARAMS);
+        hello[HELLO_RANDOM_OFFSET] = 1;
+        assert!(m.seal_proof(&hello).is_err());
+        assert!(m.seal_proof(&hello[..40]).is_err());
     }
 
     #[test]
     fn random_differs_each_time() {
         let (kp, sid) = setup();
-        let a = build_client_material(&kp.public, &sid, "a.example", 1000).unwrap();
-        let b = build_client_material(&kp.public, &sid, "a.example", 1000).unwrap();
-        assert_ne!(a.random, b.random);
+        let a = client_material(&kp.public, &sid, 1000).unwrap();
+        let b = client_material(&kp.public, &sid, 1000).unwrap();
+        let (_, ra) = wire(&a, "a.example");
+        let (_, rb) = wire(&b, "a.example");
+        assert_ne!(ra, rb);
     }
 
     #[test]

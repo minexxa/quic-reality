@@ -14,6 +14,7 @@
 
 use crate::auth::{self, SHORT_ID_LEN};
 use crate::cid::{HmacCid, CID_LEN};
+use crate::config::FallbackLimit;
 use crate::initial::{self, Header};
 use crate::salamander::Salamander;
 use anyhow::{anyhow, bail, Result};
@@ -38,6 +39,65 @@ const MAX_SEEN: usize = 200_000;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Decoy relay limits: REALITY's `limitFallbackUpload` (prober -> decoy) and
+/// `limitFallbackDownload` (decoy -> prober).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelayLimits {
+    pub upload: Option<FallbackLimit>,
+    pub download: Option<FallbackLimit>,
+}
+
+/// Token bucket for decoy traffic (REALITY's `limitFallbackUpload` /
+/// `limitFallbackDownload`). The first `after` bytes of a relay pass freely;
+/// from then on the flow is held to `rate` bytes per second with a burst
+/// capacity of `burst`. `take` never blocks - a datagram that does not fit is
+/// dropped, which to the prober is indistinguishable from ordinary loss on the
+/// path to the real site.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    after: f64,
+    rate: f64,
+    burst: f64,
+    tokens: f64,
+    last: Instant,
+}
+
+impl Bucket {
+    fn new(limit: &FallbackLimit) -> Option<Self> {
+        let (rate, burst, after) = limit.bucket_params()?;
+        Some(Self {
+            after: after as f64,
+            rate: rate as f64,
+            burst: burst as f64,
+            tokens: burst as f64,
+            last: Instant::now(),
+        })
+    }
+
+    /// True when `n` bytes fit; the tokens are consumed either way.
+    fn take(&mut self, n: usize) -> bool {
+        let mut n = n as f64;
+        if self.after > 0.0 {
+            let free = self.after.min(n);
+            self.after -= free;
+            n -= free;
+            if n == 0.0 {
+                return true;
+            }
+        }
+        let now = Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * self.rate)
+            .min(self.burst);
+        self.last = now;
+        if self.tokens >= n {
+            self.tokens -= n;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +133,9 @@ struct Table {
 struct Relay {
     upstream: tokio::net::UdpSocket,
     last: Mutex<Instant>,
+    /// Rate limits; `None` entries mean "unlimited".
+    up: Mutex<Option<Bucket>>,
+    down: Mutex<Option<Bucket>>,
 }
 
 pub struct ServerAuth {
@@ -83,6 +146,7 @@ pub struct ServerAuth {
     crypto: Arc<QuicServerConfig>,
     cid: HmacCid,
     dest: Option<SocketAddr>,
+    limits: RelayLimits,
     table: Mutex<Table>,
     relays: Mutex<HashMap<SocketAddr, Arc<Relay>>>,
     inner: OnceLock<Arc<dyn AsyncUdpSocket>>,
@@ -98,6 +162,7 @@ impl ServerAuth {
         crypto: Arc<QuicServerConfig>,
         cid: HmacCid,
         dest: Option<SocketAddr>,
+        limits: RelayLimits,
     ) -> Arc<Self> {
         Arc::new(Self {
             secret,
@@ -107,6 +172,7 @@ impl ServerAuth {
             crypto,
             cid,
             dest,
+            limits,
             table: Mutex::new(Table {
                 pending: HashMap::new(),
                 seen: HashMap::new(),
@@ -198,7 +264,7 @@ impl ServerAuth {
             self.max_skew,
             &init.random,
             &init.key_share,
-            &sni,
+            &init.hello,
             auth::now_secs(),
         )?;
 
@@ -279,6 +345,8 @@ impl ServerAuth {
                     let r = Arc::new(Relay {
                         upstream: sock,
                         last: Mutex::new(Instant::now()),
+                        up: Mutex::new(self.limits.upload.and_then(|l| Bucket::new(&l))),
+                        down: Mutex::new(self.limits.download.and_then(|l| Bucket::new(&l))),
                     });
                     map.insert(peer, r.clone());
                     let this = self.clone();
@@ -289,8 +357,14 @@ impl ServerAuth {
             }
         };
         *lock(&relay.last) = Instant::now();
-        for chunk in data.chunks(stride.max(1)) {
-            let _ = relay.upstream.try_send(chunk);
+        {
+            let mut up = lock(&relay.up);
+            for chunk in data.chunks(stride.max(1)) {
+                if up.as_mut().is_some_and(|b| !b.take(chunk.len())) {
+                    continue; // over the limit: drop, as if the decoy never got it
+                }
+                let _ = relay.upstream.try_send(chunk);
+            }
         }
     }
 
@@ -301,6 +375,12 @@ impl ServerAuth {
             {
                 Ok(Ok(n)) => {
                     *lock(&relay.last) = Instant::now();
+                    {
+                        let mut down = lock(&relay.down);
+                        if down.as_mut().is_some_and(|b| !b.take(n)) {
+                            continue; // over the limit: drop
+                        }
+                    }
                     self.send_raw(peer, &buf[..n]);
                 }
                 // ICMP "port unreachable" from the decoy shows up as an error on
@@ -483,5 +563,62 @@ impl AsyncUdpSocket for RealitySocket {
 
     fn may_fragment(&self) -> bool {
         self.inner.may_fragment()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Bandwidth;
+
+    fn limit(after: u64, rate: u64, burst: u64) -> FallbackLimit {
+        FallbackLimit {
+            after_bytes: after,
+            bytes_per_sec: Some(Bandwidth::from_bytes_per_sec(rate)),
+            burst_bytes_per_sec: Some(Bandwidth::from_bytes_per_sec(burst)),
+        }
+    }
+
+    #[test]
+    fn unlimited_when_no_rate_is_set() {
+        assert!(Bucket::new(&FallbackLimit::default()).is_none());
+        assert!(Bucket::new(&FallbackLimit {
+            after_bytes: 100,
+            ..Default::default()
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn free_bytes_pass_then_the_burst_then_nothing() {
+        // 100 free bytes, then 100 B/s with a burst of 2000. The bucket
+        // starts full, exactly like the reference's ratelimit.Bucket. The
+        // slow rate keeps the assertions independent of how long the test
+        // itself takes between statements.
+        let mut b = Bucket::new(&limit(100, 100, 2000)).unwrap();
+        assert!(b.take(60));
+        assert!(b.take(40), "the rest of the free bytes");
+        assert!(b.take(2000), "burst capacity is available right away");
+        assert!(!b.take(1), "at 100 B/s a millisecond refills a fraction of a byte");
+    }
+
+    #[test]
+    fn tokens_refill_at_the_configured_rate() {
+        let mut b = Bucket::new(&limit(0, 1000, 1000)).unwrap();
+        assert!(b.take(1000), "burst");
+        assert!(!b.take(500), "empty; refilling 500 bytes takes 500 ms");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(b.take(150), "at least 200 ms of refill at 1000 B/s");
+        assert!(!b.take(200), "far less than 200 ms passed since the last take");
+    }
+
+    #[test]
+    fn a_free_byte_never_starves_the_bucket() {
+        // after_bytes larger than one datagram: the remainder carries over.
+        let mut b = Bucket::new(&limit(150, 100, 500)).unwrap();
+        assert!(b.take(100));
+        assert!(b.take(50), "50 free bytes still left");
+        assert!(b.take(500), "burst capacity");
+        assert!(!b.take(1));
     }
 }

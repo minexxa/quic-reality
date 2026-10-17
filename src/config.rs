@@ -16,6 +16,12 @@ impl Bandwidth {
     pub fn bytes_per_sec(&self) -> u64 {
         self.0
     }
+
+    /// Raw bytes per second, for tests that need a number instead of a string.
+    #[cfg(test)]
+    pub const fn from_bytes_per_sec(v: u64) -> Self {
+        Self(v)
+    }
 }
 
 impl Serialize for Bandwidth {
@@ -157,6 +163,46 @@ pub struct RealityConfig {
     /// Server only: accepted clock difference of the ClientHello timestamp.
     #[serde(default = "default_skew")]
     pub max_time_skew_secs: u64,
+    /// Server only: rate limit for decoy traffic on the prober -> decoy leg.
+    /// REALITY's `limitFallbackUpload`. Unlimited by default.
+    #[serde(default)]
+    pub limit_fallback_upload: FallbackLimit,
+    /// Server only: rate limit for decoy traffic on the decoy -> prober leg.
+    /// REALITY's `limitFallbackDownload`. Unlimited by default.
+    #[serde(default)]
+    pub limit_fallback_download: FallbackLimit,
+}
+
+/// REALITY's `limitFallbackUpload` / `limitFallbackDownload`: a token bucket
+/// for decoy (fallback) traffic, so a prober cannot use the relayed real site
+/// as a free amplifier. All fields default to "no limit".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct FallbackLimit {
+    /// Bytes that pass unthrottled before the limit applies.
+    #[serde(default)]
+    pub after_bytes: u64,
+    /// Sustained rate in bytes per second; unset or 0 means unlimited.
+    #[serde(default)]
+    pub bytes_per_sec: Option<Bandwidth>,
+    /// Bucket capacity in bytes per second. Raised to `bytes_per_sec` when
+    /// smaller, exactly like the reference implementation clamps it.
+    #[serde(default)]
+    pub burst_bytes_per_sec: Option<Bandwidth>,
+}
+
+impl FallbackLimit {
+    /// `(rate, burst, after_bytes)`, or `None` when the limit is disabled.
+    pub fn bucket_params(&self) -> Option<(u64, u64, u64)> {
+        let rate = self.bytes_per_sec.map_or(0, |b| b.bytes_per_sec());
+        if rate == 0 {
+            return None;
+        }
+        let burst = self
+            .burst_bytes_per_sec
+            .map_or(rate, |b| b.bytes_per_sec())
+            .max(rate);
+        Some((rate, burst, self.after_bytes))
+    }
 }
 
 fn default_server_name() -> String {
@@ -362,6 +408,16 @@ server_name = "www.cloudflare.com"
 # Probes and other unauthenticated traffic are relayed (as UDP) to this real site.
 dest = "www.cloudflare.com:443"
 
+# Optional: throttle the decoy relay so a prober cannot use the real site as a
+# free amplifier. `after_bytes` pass freely, then the flow is held to
+# `bytes_per_sec` with a burst of `burst_bytes_per_sec` (>= bytes_per_sec).
+# [reality.limit_fallback_upload]
+# after_bytes = 65536
+# bytes_per_sec = "1 Mbps"
+# burst_bytes_per_sec = "2 Mbps"
+# [reality.limit_fallback_download]
+# bytes_per_sec = "1 Mbps"
+
 [quic]
 congestion = "bbr"
 # Hysteria2-style fixed-rate congestion control instead of BBR:
@@ -463,6 +519,51 @@ mod tests {
         let c: Config = toml::from_str(&s).unwrap();
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("brutal_bandwidth"), "{err}");
+    }
+
+    #[test]
+    fn fallback_limit_bucket_params() {
+        // Default: unlimited.
+        assert_eq!(FallbackLimit::default().bucket_params(), None);
+        // Rate only: burst defaults to the rate.
+        let l = FallbackLimit {
+            after_bytes: 1024,
+            bytes_per_sec: Some(Bandwidth(1000)),
+            burst_bytes_per_sec: None,
+        };
+        assert_eq!(l.bucket_params(), Some((1000, 1000, 1024)));
+        // A burst below the rate is raised to it, like the reference.
+        let l = FallbackLimit {
+            after_bytes: 0,
+            bytes_per_sec: Some(Bandwidth(2000)),
+            burst_bytes_per_sec: Some(Bandwidth(500)),
+        };
+        assert_eq!(l.bucket_params(), Some((2000, 2000, 0)));
+        // Bytes without a rate is still unlimited.
+        let l = FallbackLimit {
+            after_bytes: 10,
+            ..Default::default()
+        };
+        assert_eq!(l.bucket_params(), None);
+    }
+
+    #[test]
+    fn fallback_limits_parse_from_toml() {
+        let kp = auth::KeyPair::generate();
+        let s = format!(
+            "mode='server'\nlisten='1.2.3.4:443'\n[reality]\nprivate_key='{}'\nshort_id='00'\ndest='www.cloudflare.com:443'\n[reality.limit_fallback_upload]\nafter_bytes=4096\nbytes_per_sec='1 Mbps'\nburst_bytes_per_sec=250000\n[reality.limit_fallback_download]\nbytes_per_sec='512 kbps'\n",
+            kp.private_hex()
+        );
+        let c: Config = toml::from_str(&s).unwrap();
+        c.validate().unwrap();
+        assert_eq!(
+            c.reality.limit_fallback_upload.bucket_params(),
+            Some((1_000_000 / 8, 250_000, 4096))
+        );
+        assert_eq!(
+            c.reality.limit_fallback_download.bucket_params(),
+            Some((512_000 / 8, 512_000 / 8, 0))
+        );
     }
 
     #[test]

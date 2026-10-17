@@ -73,6 +73,9 @@ pub struct ClientInitial {
     pub random: [u8; 32],
     pub key_share: [u8; 32],
     pub sni: Option<String>,
+    /// The complete ClientHello handshake message, exactly as it arrived: the
+    /// REALITY proof authenticates every byte of it (see `auth`).
+    pub hello: Vec<u8>,
 }
 
 /// Decrypts the first Initial of `datagram` and parses the ClientHello inside.
@@ -266,6 +269,7 @@ pub fn parse_client_hello(hs: &[u8]) -> Result<ClientInitial> {
         random,
         key_share: key_share.ok_or_else(|| anyhow!("no X25519 key share"))?,
         sni,
+        hello: hs[..4 + len].to_vec(),
     })
 }
 

@@ -6,6 +6,13 @@
 //! `auth_key` (i.e. someone who knows the server's static private key) can
 //! produce it, so the client can authenticate the server without any CA.
 //!
+//! The key pair and the certificate itself are generated **once per process**,
+//! exactly like xtls/reality, which builds its temporary certificate in
+//! `init()` and only rewrites the signature slot per connection. Minting a
+//! fresh key pair per connection buys nothing (the certificate is never seen
+//! by a prober, and the HMAC is what authenticates it) and costs an Ed25519
+//! key generation plus a self-signature on every handshake.
+//!
 //! Ed25519 is not an accident: the HMAC is exactly 64 bytes wide, the width of
 //! an Ed25519 signature, so it drops into the X.509 signature slot without
 //! disturbing the DER length fields.  The catch is that a Chrome
@@ -17,7 +24,7 @@ use crate::auth;
 use anyhow::{anyhow, bail, Result};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::sign::{CertifiedKey, Signer, SigningKey};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Reads one DER TLV at `*pos`; returns (tag, content_start, content_end) and
 /// advances `*pos` past the element.
@@ -128,28 +135,60 @@ fn layout(der: &[u8]) -> Option<Layout> {
     })
 }
 
-/// Mint the temporary certificate (and its signing key) for one connection.
-pub fn mint(auth_key: &[u8; 32], server_name: &str) -> Result<CertifiedKey> {
+/// The process-wide throw-away certificate: one Ed25519 key pair and the DER
+/// of a self-signed certificate for it. Only the signature slot differs per
+/// connection, so the DER is cloned and the slot rewritten on every `mint`.
+struct Template {
+    key: Arc<dyn SigningKey>,
+    der: Vec<u8>,
+    ed25519_pub: [u8; 32],
+    signature: (usize, usize),
+}
+
+fn build_template() -> Result<Template> {
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
         .map_err(|e| anyhow!("generate ed25519 key: {e}"))?;
-    let params = rcgen::CertificateParams::new(vec![server_name.to_string()])
+    // No subject alternative names: nothing ever name-checks this certificate
+    // (our client verifies the HMAC instead, a prober never sees it), and the
+    // reference implementation's temporary certificate carries no name either.
+    let params = rcgen::CertificateParams::new(Vec::new())
         .map_err(|e| anyhow!("certificate params: {e}"))?;
     let cert = params
         .self_signed(&key_pair)
         .map_err(|e| anyhow!("self-sign: {e}"))?;
-    let mut der = cert.der().to_vec();
+    let der = cert.der().to_vec();
 
     let l = layout(&der).ok_or_else(|| anyhow!("unexpected certificate layout"))?;
-    let pubkey: [u8; 32] = der[l.ed25519_pub.0..l.ed25519_pub.1].try_into()?;
-    let sig = auth::cert_signature(auth_key, &pubkey);
-    der[l.signature.0..l.signature.1].copy_from_slice(&sig);
-
+    let ed25519_pub: [u8; 32] = der[l.ed25519_pub.0..l.ed25519_pub.1].try_into()?;
     let pkcs8 = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
     let signing_key = rustls::crypto::ring::sign::any_eddsa_type(&pkcs8)
         .map_err(|e| anyhow!("signing key: {e}"))?;
+    Ok(Template {
+        key: signing_key,
+        der,
+        ed25519_pub,
+        signature: l.signature,
+    })
+}
+
+static TEMPLATE: OnceLock<Result<Template, String>> = OnceLock::new();
+
+fn template() -> Result<&'static Template> {
+    TEMPLATE
+        .get_or_init(|| build_template().map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|e| anyhow!("temporary certificate: {e}"))
+}
+
+/// Mint the temporary certificate for one connection: the shared DER with the
+/// REALITY HMAC of `auth_key` in its signature slot.
+pub fn mint(auth_key: &[u8; 32]) -> Result<CertifiedKey> {
+    let t = template()?;
+    let mut der = t.der.clone();
+    der[t.signature.0..t.signature.1].copy_from_slice(&auth::cert_signature(auth_key, &t.ed25519_pub));
     Ok(CertifiedKey::new(
         vec![CertificateDer::from(der)],
-        Arc::new(ForcedEd25519(signing_key)),
+        Arc::new(ForcedEd25519(t.key.clone())),
     ))
 }
 
@@ -180,7 +219,7 @@ mod tests {
     #[test]
     fn minted_cert_verifies_only_with_the_same_key() {
         let key = [7u8; 32];
-        let ck = mint(&key, "www.example.com").unwrap();
+        let ck = mint(&key).unwrap();
         let der = ck.cert[0].as_ref();
         check(der, &key).unwrap();
         assert!(check(der, &[8u8; 32]).is_err());
@@ -197,10 +236,18 @@ mod tests {
     }
 
     #[test]
-    fn every_cert_has_a_fresh_key() {
-        let key = [1u8; 32];
-        let a = mint(&key, "a.example").unwrap();
-        let b = mint(&key, "a.example").unwrap();
+    fn one_shared_key_per_process_only_the_hmac_differs() {
+        let a = mint(&[1u8; 32]).unwrap();
+        let b = mint(&[2u8; 32]).unwrap();
+        // The key pair is process-wide, exactly like the reference's init();
+        // only the signature slot - the REALITY HMAC - differs per connection.
+        assert_eq!(
+            public_key(a.cert[0].as_ref()),
+            public_key(b.cert[0].as_ref())
+        );
         assert_ne!(a.cert[0].as_ref(), b.cert[0].as_ref());
+        check(a.cert[0].as_ref(), &[1u8; 32]).unwrap();
+        check(b.cert[0].as_ref(), &[2u8; 32]).unwrap();
+        assert!(check(a.cert[0].as_ref(), &[2u8; 32]).is_err());
     }
 }

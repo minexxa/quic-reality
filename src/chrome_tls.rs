@@ -34,7 +34,7 @@
 //! switch: bytes returned together with a key change are still sent at the
 //! *previous* level, so the client's Finished goes out under Handshake keys.
 
-use crate::auth::ClientMaterial;
+use crate::auth::{ClientMaterial, HELLO_RANDOM_OFFSET};
 use crate::cert;
 use bytes::BytesMut;
 use hkdf::Hkdf;
@@ -1444,19 +1444,22 @@ fn sanitize_transport_params(raw: &[u8]) -> Vec<u8> {
 pub struct ChromeClientConfig {
     priv_key: [u8; 32],
     pub_key: [u8; 32],
-    random: [u8; 32],
     auth_key: [u8; 32],
+    /// Seals the REALITY proof into the ClientHello in `start_session`: the
+    /// AAD is the whole hello, so it can only be sealed once the hello is
+    /// complete - with a zeroed `random`, which the ciphertext then replaces.
+    material: ClientMaterial,
 }
 
 impl ChromeClientConfig {
-    /// One config per connection: both the key share and the REALITY `random`
-    /// are single-use, so the material is copied in and never reused.
-    pub fn new(m: &ClientMaterial) -> Self {
+    /// One config per connection: both the key share and the REALITY proof
+    /// are single-use, so the material is moved in and never reused.
+    pub fn new(m: ClientMaterial) -> Self {
         Self {
             priv_key: m.secret.to_bytes(),
             pub_key: m.public,
-            random: m.random,
-            auth_key: m.auth_key,
+            auth_key: m.auth_key(),
+            material: m,
         }
     }
 
@@ -1505,7 +1508,17 @@ impl CryptoClientConfig for ChromeClientConfig {
         let mut quic_params = Vec::new();
         params.write(&mut quic_params);
         let quic_params = sanitize_transport_params(&quic_params);
-        let hello = build_client_hello(server_name, &self.random, &self.pub_key, &quic_params);
+        // The REALITY proof authenticates the whole hello, so the hello is
+        // built first - with a zeroed `random`, the field the ciphertext will
+        // occupy - sealed over, and only then patched. This is xtls/reality's
+        // chicken-and-egg trick for `session_id`, one field over: the tag can
+        // never cover itself.
+        let mut hello = build_client_hello(server_name, &[0u8; 32], &self.pub_key, &quic_params);
+        let proof = self
+            .material
+            .seal_proof(&hello)
+            .expect("sealing our own ClientHello cannot fail (quinn unwraps the equivalent rustls step)");
+        hello[HELLO_RANDOM_OFFSET..HELLO_RANDOM_OFFSET + 32].copy_from_slice(&proof);
         let mut tx = VecDeque::new();
         tx.push_back((false, hello));
         Ok(Box::new(self.make_session(tx)))
@@ -1599,6 +1612,7 @@ mod tests {
             let ci = crate::initial::parse_client_hello(&h).unwrap();
             assert_eq!((ci.random, ci.key_share), (random, share));
             assert_eq!(ci.sni.as_deref(), Some("www.example.com"));
+            assert_eq!(ci.hello, h, "the parser must hand out the exact hello bytes");
         }
         assert!(orders.len() > 1, "extension order must vary between connections");
     }

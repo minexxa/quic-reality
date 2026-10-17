@@ -37,7 +37,7 @@ pub fn make_client_config(
     m: ClientMaterial,
     transport: Arc<TransportConfig>,
 ) -> Result<quinn::ClientConfig> {
-    let crypto = Arc::new(chrome_tls::ChromeClientConfig::new(&m));
+    let crypto = Arc::new(chrome_tls::ChromeClientConfig::new(m));
     let mut cfg = quinn::ClientConfig::new(crypto);
     cfg.transport_config(transport);
     Ok(cfg)
@@ -101,10 +101,9 @@ pub fn make_base_server_crypto() -> Result<Arc<QuicServerConfig>> {
 /// Per-connection server config serving the temporary REALITY certificate.
 pub fn make_conn_server_config(
     auth_key: &[u8; 32],
-    server_name: &str,
     transport: Arc<TransportConfig>,
 ) -> Result<quinn::ServerConfig> {
-    let ck = cert::mint(auth_key, server_name)?;
+    let ck = cert::mint(auth_key)?;
     let mut cfg = quinn::ServerConfig::with_crypto(server_crypto(Some(Arc::new(ck)))?);
     cfg.transport_config(transport);
     Ok(cfg)
