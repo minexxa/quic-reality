@@ -1,4 +1,5 @@
 mod auth;
+mod brutal;
 mod cert;
 mod chrome_tls;
 mod cid;

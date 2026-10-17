@@ -126,6 +126,35 @@ async fn authenticated_client_can_proxy_tcp() {
     echo_roundtrip(&mgr, echo, &big).await;
 }
 
+/// The hysteria-style brutal controller must proxy traffic like any other:
+/// the whole pipeline (auth, streams, framing) runs over a connection whose
+/// congestion window and pacing come from a fixed bandwidth instead of BBR.
+#[tokio::test]
+async fn brutal_congestion_control_proxies_traffic() {
+    let decoy = decoy();
+    let kp = KeyPair::generate();
+    let server_cfg: Config = toml::from_str(&format!(
+        "mode='server'\nlisten='127.0.0.1:0'\n[reality]\nprivate_key='{}'\nshort_id='0123456789abcdef'\nserver_name='{SNI}'\ndest='{}'\n[security]\nallow_private_targets=true\n[quic]\ncongestion='brutal'\nbrutal_bandwidth='1 Gbps'\n",
+        kp.private_hex(),
+        decoy.addr
+    ))
+    .unwrap();
+    server_cfg.validate().unwrap();
+    let srv = server::start(&server_cfg).await.unwrap();
+    let echo = tcp_echo().await;
+    let client_cfg: Config = toml::from_str(&format!(
+        "mode='client'\nserver='{}'\n[reality]\npublic_key='{}'\nshort_id='0123456789abcdef'\nserver_name='{SNI}'\n[quic]\ncongestion='brutal'\nbrutal_bandwidth='1 Gbps'\n",
+        srv.local_addr,
+        kp.public_hex()
+    ))
+    .unwrap();
+    client_cfg.validate().unwrap();
+    let mgr = ConnManager::new(&client_cfg).await.unwrap();
+    echo_roundtrip(&mgr, echo, b"hello over brutal").await;
+    let big: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8).collect();
+    echo_roundtrip(&mgr, echo, &big).await;
+}
+
 #[tokio::test]
 async fn prober_receives_the_decoys_real_certificate() {
     let e = env(true, false).await;

@@ -145,6 +145,29 @@ pub fn make_transport(q: &QuicConfig) -> Arc<TransportConfig> {
         Congestion::NewReno => {
             t.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default()));
         }
+        Congestion::Brutal => {
+            t.congestion_controller_factory(Arc::new(crate::brutal::BrutalConfig::new(
+                q.brutal_bps(),
+                q.brutal_disable_loss_compensation,
+            )));
+            // Brutal's window is exactly one bandwidth-delay product, which
+            // on low-delay paths is only a few packets. quinn's default ACK
+            // policy (every other ack-eliciting packet) degenerates to the
+            // 25 ms MaxAckDelay timer whenever the window holds a single
+            // packet, stretching the effective RTT and collapsing the send
+            // rate to a fraction of the configured bandwidth. Requesting one
+            // immediate ACK per ack-eliciting packet (QUIC ACK Frequency
+            // extension, draft-ietf-quic-ack-frequency) keeps the window
+            // recycling at the true RTT. quinn-proto only sends the request
+            // when the peer advertises `min_ack_delay` (all quinn peers do),
+            // so non-quinn peers silently keep the default policy.
+            t.ack_frequency_config(Some({
+                let mut c = quinn_proto::AckFrequencyConfig::default();
+                c.ack_eliciting_threshold(quinn::VarInt::from_u32(0));
+                c.max_ack_delay(Some(Duration::from_millis(1)));
+                c
+            }));
+        }
     }
     Arc::new(t)
 }
