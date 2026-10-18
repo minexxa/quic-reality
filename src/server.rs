@@ -1,13 +1,14 @@
 use crate::auth::KeyPair;
 use crate::cid::HmacCid;
-use crate::config::Config;
+use crate::config::{Config, QuicConfig};
+use crate::mimic::Mimicry;
 use crate::protocol::*;
 use crate::reality_socket::{RealitySocket, RelayLimits, ServerAuth};
 use crate::salamander::Salamander;
 use crate::tls;
 use crate::util::{is_public_ip, relay_tcp_quic};
 use anyhow::{anyhow, bail, Context, Result};
-use quinn::{Endpoint, EndpointConfig, RecvStream, SendStream, TokioRuntime, TransportConfig};
+use quinn::{Endpoint, EndpointConfig, RecvStream, SendStream, TokioRuntime};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +47,9 @@ pub struct Running {
     pub endpoint: Endpoint,
     #[allow(dead_code)]
     pub auth: Arc<ServerAuth>,
+    /// Test-only handle to the dest probe cache (see `Mimicry::cached`).
+    #[cfg(test)]
+    pub mimicry: Option<Arc<Mimicry>>,
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -63,10 +67,26 @@ pub async fn start(cfg: &Config) -> Result<Running> {
     // Keys derived from the long-term private key survive restarts (see cid::derive_keys).
     let (cid_key, reset_key) = crate::cid::derive_keys(&kp.private.to_bytes());
     let cid = HmacCid::from_key(cid_key);
+    // Dest handshake mimicry: probe the real site's QUIC handshake once per
+    // SNI (cached, prewarmed below) and replay its shape for authenticated
+    // clients - the reference implementation's record-length padding, ported
+    // to QUIC messages.  A probe that fails must never gate the proxy, so a
+    // broken probe endpoint degrades to the default handshake.
+    let mimicry = match Mimicry::new(cfg.reality.mimic_dest, dest) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("dest handshake mimicry disabled: {e}");
+            None
+        }
+    };
+    let server_names = cfg.server_names();
+    if let Some(m) = &mimicry {
+        m.prewarm(&server_names);
+    }
     let auth = ServerAuth::new(
         kp.private.clone(),
         cfg.short_ids()?,
-        cfg.server_names(),
+        server_names,
         cfg.reality.max_time_skew_secs,
         base.clone(),
         cid.clone(),
@@ -75,6 +95,7 @@ pub async fn start(cfg: &Config) -> Result<Running> {
             upload: Some(cfg.reality.limit_fallback_upload),
             download: Some(cfg.reality.limit_fallback_download),
         },
+        mimicry.clone(),
     );
     let salamander = cfg
         .obfuscation
@@ -90,7 +111,7 @@ pub async fn start(cfg: &Config) -> Result<Running> {
     let cid_for_endpoint = cid.clone();
     ep_cfg.cid_generator(move || Box::new(cid_for_endpoint.clone()));
 
-    let transport = tls::make_transport(&cfg.quic);
+    let transport = tls::make_transport(&cfg.quic, None);
     let mut base_cfg = quinn::ServerConfig::with_crypto(base);
     base_cfg.transport_config(transport.clone());
     let endpoint = Endpoint::new_with_abstract_socket(
@@ -114,12 +135,13 @@ pub async fn start(cfg: &Config) -> Result<Running> {
     let allow_private = cfg.security.allow_private_targets;
     let accept_ep = endpoint.clone();
     let accept_auth = auth.clone();
+    let accept_quic = cfg.quic.clone();
     tokio::spawn(async move {
         while let Some(incoming) = accept_ep.accept().await {
             let auth = accept_auth.clone();
-            let transport = transport.clone();
+            let quic = accept_quic.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_incoming(incoming, auth, transport, allow_private).await {
+                if let Err(e) = handle_incoming(incoming, auth, quic, allow_private).await {
                     debug!("connection ended: {e:#}");
                 }
             });
@@ -130,13 +152,15 @@ pub async fn start(cfg: &Config) -> Result<Running> {
         public_key_hex: kp.public_hex(),
         endpoint,
         auth,
+        #[cfg(test)]
+        mimicry,
     })
 }
 
 async fn handle_incoming(
     incoming: quinn::Incoming,
     auth: Arc<ServerAuth>,
-    transport: Arc<TransportConfig>,
+    quic: QuicConfig,
     allow_private: bool,
 ) -> Result<()> {
     let peer = incoming.remote_address();
@@ -147,7 +171,12 @@ async fn handle_incoming(
         incoming.refuse();
         bail!("no authentication record for {peer}");
     };
-    let cfg = tls::make_conn_server_config(&pa.auth_key, transport)?;
+    // The dest's probed flight shapes this connection's handshake *and* its
+    // transport parameters; a missing one (mimicry off, probe failed) keeps
+    // the defaults.
+    let flight = auth.flight(&pa.server_name).await;
+    let transport = tls::make_transport(&quic, flight.as_deref());
+    let cfg = tls::make_conn_server_config(&pa.auth_key, flight.as_deref(), transport)?;
     let conn = incoming.accept_with(Arc::new(cfg))?.await?;
     info!("client connected from {peer} (sni {})", pa.server_name);
 

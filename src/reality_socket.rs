@@ -16,6 +16,7 @@ use crate::auth::{self, SHORT_ID_LEN};
 use crate::cid::{HmacCid, CID_LEN};
 use crate::config::FallbackLimit;
 use crate::initial::{self, Header};
+use crate::mimic::{DestFlight, Mimicry};
 use crate::salamander::Salamander;
 use anyhow::{anyhow, bail, Result};
 use quinn::crypto::rustls::QuicServerConfig;
@@ -147,6 +148,9 @@ pub struct ServerAuth {
     cid: HmacCid,
     dest: Option<SocketAddr>,
     limits: RelayLimits,
+    /// Dest handshake probe cache; `None` when mimicry is off or no dest is
+    /// configured, in which case handshakes keep the default shape.
+    mimicry: Option<Arc<Mimicry>>,
     table: Mutex<Table>,
     relays: Mutex<HashMap<SocketAddr, Arc<Relay>>>,
     inner: OnceLock<Arc<dyn AsyncUdpSocket>>,
@@ -163,6 +167,7 @@ impl ServerAuth {
         cid: HmacCid,
         dest: Option<SocketAddr>,
         limits: RelayLimits,
+        mimicry: Option<Arc<Mimicry>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             secret,
@@ -173,6 +178,7 @@ impl ServerAuth {
             cid,
             dest,
             limits,
+            mimicry,
             table: Mutex::new(Table {
                 pending: HashMap::new(),
                 seen: HashMap::new(),
@@ -181,6 +187,13 @@ impl ServerAuth {
             relays: Mutex::new(HashMap::new()),
             inner: OnceLock::new(),
         })
+    }
+
+    /// The dest's probed handshake flight for `sni`, or `None` when mimicry
+    /// is off, no dest is configured, or the probe failed - the caller then
+    /// keeps the default handshake shape.
+    pub async fn flight(&self, sni: &str) -> Option<Arc<DestFlight>> {
+        self.mimicry.as_ref()?.flight(sni).await
     }
 
     /// Authentication result for a connection quinn is about to accept.

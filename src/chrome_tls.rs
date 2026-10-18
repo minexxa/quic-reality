@@ -59,7 +59,7 @@ use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256, Sha384};
 use std::collections::VecDeque;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 use tracing::debug;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -433,6 +433,20 @@ static SUITES: [Suite; 3] = [
 thread_local! {
     /// Test hook: the TLS 1.3 suite the last handshake on this thread negotiated.
     pub static LAST_NEGOTIATED: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+    /// Test hook: DER length of the last certificate this client accepted.
+    pub static LAST_CERT_DER_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test hook: NewSessionTicket messages received by the last handshake.
+    pub static LAST_NST_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test hook: the *lengths* of those NewSessionTicket messages, in order.
+    /// Dest mimicry replays the dest's exact ticket sizes, so the lengths are
+    /// as much of the contract as the count.
+    pub static LAST_NST_LENS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Test hook: the server's transport parameters as an *authenticated*
+    /// client received them, restricted to the fields dest mimicry covers.
+    /// Background probe sessions must not pollute it (same race as
+    /// `LAST_NST_COUNT`).
+    pub static LAST_PEER_TP: std::cell::RefCell<Option<crate::mimic::DestTransportParams>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn suite_by_id(id: u16) -> Result<&'static Suite, TlsErr> {
@@ -910,6 +924,27 @@ pub fn build_client_hello(
 
 // --------------------------------------------------------------------- session
 
+/// What a dest probe records from a server's TLS flight.
+///
+/// The server side of quic-reality serves a throw-away certificate whose only
+/// job is authentication; to make an *authenticated* connection look like the
+/// dest's real QUIC server, the flight the dest produces for this very
+/// ClientHello is recorded once and replayed in shape (see [`crate::mimic`]).
+#[derive(Debug, Default)]
+pub struct Recorded {
+    /// Negotiated TLS 1.3 cipher suite from the ServerHello.
+    pub suite: Option<u16>,
+    /// Total size of the Certificate handshake message (header included).
+    pub cert_msg_len: Option<usize>,
+    /// `(message size, lifetime)` of every NewSessionTicket.
+    pub nst: Vec<(usize, u32)>,
+    /// Raw `quic_transport_parameters` bytes from the EncryptedExtensions.
+    pub tp: Vec<u8>,
+}
+
+/// Shared recording target of a probe session.
+pub type Recorder = Arc<Mutex<Recorded>>;
+
 /// Where we are in the TLS 1.3 handshake.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -962,6 +997,11 @@ pub struct ChromeSession {
     alpn: Option<Vec<u8>>,
     peer_cert: Option<CertificateDer<'static>>,
     got_handshake_data: bool,
+    /// Probe mode: the server is an ordinary TLS 1.3 endpoint (the dest), not a
+    /// REALITY peer, so certificate authentication is skipped and the flight is
+    /// recorded instead.
+    probe: bool,
+    recorder: Option<Recorder>,
 }
 
 impl ChromeSession {
@@ -972,6 +1012,18 @@ impl ChromeSession {
     /// over that value, so it is captured before the message joins the
     /// transcript.
     fn handle(&mut self, msg: &[u8], before: &[u8]) -> Result<(), TlsErr> {
+        if let Some(rec) = &self.recorder {
+            let mut r = rec.lock().unwrap_or_else(|e| e.into_inner());
+            match msg[0] {
+                HS_CERTIFICATE => r.cert_msg_len = Some(msg.len()),
+                // NewSessionTicket: lifetime(4) age_add(4) nonce_len(1) ...
+                HS_SESSION_TICKET if msg.len() >= 8 => {
+                    let lifetime = u32::from_be_bytes([msg[4], msg[5], msg[6], msg[7]]);
+                    r.nst.push((msg.len(), lifetime));
+                }
+                _ => {}
+            }
+        }
         match (self.state, msg[0]) {
             (State::AwaitServerHello, HS_SERVER_HELLO) => self.on_server_hello(&msg[4..]),
             (State::AwaitEncryptedExtensions, HS_ENCRYPTED_EXTENSIONS) => {
@@ -984,7 +1036,16 @@ impl ChromeSession {
             (State::AwaitFinished, HS_FINISHED) => self.on_finished(&msg[4..], before),
             // NewSessionTicket / KeyUpdate.  A REALITY client never resumes and
             // quinn drives key updates itself, so there is nothing to do.
-            (State::Done, HS_SESSION_TICKET) => Ok(()),
+            (State::Done, HS_SESSION_TICKET) => {
+                // Test hook counts what an *authenticated* client sees; probe
+                // sessions (background dest probes) must not pollute it.
+                #[cfg(test)]
+                if !self.probe {
+                    LAST_NST_COUNT.with(|c| c.set(c.get() + 1));
+                    LAST_NST_LENS.with(|l| l.borrow_mut().push(msg.len()));
+                }
+                Ok(())
+            }
             // RFC 9001 §6: a TLS KeyUpdate in QUIC is a connection error; QUIC
             // has its own key update mechanism.
             (State::Done, HS_KEY_UPDATE) => Err(TlsErr::bad("TLS KeyUpdate is not allowed in QUIC")),
@@ -1015,6 +1076,9 @@ impl ChromeSession {
         #[cfg(test)]
         LAST_NEGOTIATED.with(|c| c.set(suite_id));
         self.suite = Some(suite);
+        if let Some(rec) = &self.recorder {
+            rec.lock().unwrap_or_else(|e| e.into_inner()).suite = Some(suite_id);
+        }
 
         // supported_versions and key_share are mandatory in a TLS 1.3 ServerHello.
         // The server's transport parameters are NOT here: RFC 9001 §7.4 puts them
@@ -1094,11 +1158,25 @@ impl ChromeSession {
                 // RFC 9001 §7.4: the server's transport parameters ride here,
                 // not in the ServerHello.
                 EXT_QUIC_TP => {
+                    if let Some(rec) = &self.recorder {
+                        rec.lock().unwrap_or_else(|e| e.into_inner()).tp = data.to_vec();
+                    }
                     let params = TransportParameters::read(
                         Side::Client,
                         &mut Cursor::new(data),
                     )
                     .map_err(|_| TlsErr::Bad("malformed transport parameters"))?;
+                    // `TransportParameters` has no public field getters, so the
+                    // test hook re-encodes the wire form and runs it through the
+                    // same extractor the probe uses (mimic::parse_transport_params).
+                    #[cfg(test)]
+                    if !self.probe {
+                        let mut buf = Vec::new();
+                        params.write(&mut buf);
+                        LAST_PEER_TP.with(|t| {
+                            *t.borrow_mut() = Some(crate::mimic::parse_transport_params(&buf))
+                        });
+                    }
                     self.peer_params = Some(params);
                 }
                 EXT_ALPN => {
@@ -1135,6 +1213,8 @@ impl ChromeSession {
         let cert = list.vec24()?;
         // REALITY serves a single certificate; whatever follows it is noise.
         self.peer_cert = Some(CertificateDer::from(cert.to_vec()));
+        #[cfg(test)]
+        LAST_CERT_DER_LEN.with(|c| c.set(cert.len()));
         self.state = State::AwaitCertificateVerify;
         Ok(())
     }
@@ -1143,6 +1223,14 @@ impl ChromeSession {
         let mut r = Reader::new(body);
         let scheme = r.u16()?;
         let sig = r.vec16()?;
+        if self.probe {
+            // A probe only records the flight: the certificate is the dest's
+            // real one, signed with whatever algorithm the dest uses. Nothing
+            // here authenticates anything, so there is nothing to check.
+            let _ = (scheme, sig, before);
+            self.state = State::AwaitFinished;
+            return Ok(());
+        }
         if scheme != SIG_ED25519 {
             return Err(TlsErr::bad("unsupported CertificateVerify algorithm"));
         }
@@ -1448,7 +1536,11 @@ pub struct ChromeClientConfig {
     /// Seals the REALITY proof into the ClientHello in `start_session`: the
     /// AAD is the whole hello, so it can only be sealed once the hello is
     /// complete - with a zeroed `random`, which the ciphertext then replaces.
-    material: ClientMaterial,
+    /// `None` in probe mode, where there is no proof to seal.
+    material: Option<ClientMaterial>,
+    /// Probe mode: no REALITY authentication, the flight is recorded.
+    probe: bool,
+    recorder: Option<Recorder>,
 }
 
 impl ChromeClientConfig {
@@ -1459,7 +1551,25 @@ impl ChromeClientConfig {
             priv_key: m.secret.to_bytes(),
             pub_key: m.public,
             auth_key: m.auth_key(),
-            material: m,
+            material: Some(m),
+            probe: false,
+            recorder: None,
+        }
+    }
+
+    /// A recording client used to probe a dest: the same hello shape a real
+    /// client sends (same suites, same extensions, same order), but with a
+    /// fresh ephemeral key, no REALITY proof and no certificate check. What it
+    /// sees from the dest is the flight to mimic (see [`crate::mimic`]).
+    pub fn probe(recorder: Recorder) -> Self {
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        Self {
+            priv_key: secret.to_bytes(),
+            pub_key: PublicKey::from(&secret).to_bytes(),
+            auth_key: [0u8; 32],
+            material: None,
+            probe: true,
+            recorder: Some(recorder),
         }
     }
 
@@ -1485,6 +1595,8 @@ impl ChromeClientConfig {
             alpn: None,
             peer_cert: None,
             got_handshake_data: false,
+            probe: self.probe,
+            recorder: self.recorder.clone(),
         }
     }
 }
@@ -1508,17 +1620,27 @@ impl CryptoClientConfig for ChromeClientConfig {
         let mut quic_params = Vec::new();
         params.write(&mut quic_params);
         let quic_params = sanitize_transport_params(&quic_params);
-        // The REALITY proof authenticates the whole hello, so the hello is
-        // built first - with a zeroed `random`, the field the ciphertext will
-        // occupy - sealed over, and only then patched. This is xtls/reality's
-        // chicken-and-egg trick for `session_id`, one field over: the tag can
-        // never cover itself.
-        let mut hello = build_client_hello(server_name, &[0u8; 32], &self.pub_key, &quic_params);
-        let proof = self
-            .material
-            .seal_proof(&hello)
-            .expect("sealing our own ClientHello cannot fail (quinn unwraps the equivalent rustls step)");
-        hello[HELLO_RANDOM_OFFSET..HELLO_RANDOM_OFFSET + 32].copy_from_slice(&proof);
+        let hello = match &self.material {
+            // The REALITY proof authenticates the whole hello, so the hello is
+            // built first - with a zeroed `random`, the field the ciphertext
+            // will occupy - sealed over, and only then patched. This is
+            // xtls/reality's chicken-and-egg trick for `session_id`, one field
+            // over: the tag can never cover itself.
+            Some(m) => {
+                let mut hello = build_client_hello(server_name, &[0u8; 32], &self.pub_key, &quic_params);
+                let proof = m
+                    .seal_proof(&hello)
+                    .expect("sealing our own ClientHello cannot fail (quinn unwraps the equivalent rustls step)");
+                hello[HELLO_RANDOM_OFFSET..HELLO_RANDOM_OFFSET + 32].copy_from_slice(&proof);
+                hello
+            }
+            // Probe: an ordinary hello with a fresh random - nothing to seal.
+            None => {
+                let mut random = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut random);
+                build_client_hello(server_name, &random, &self.pub_key, &quic_params)
+            }
+        };
         let mut tx = VecDeque::new();
         tx.push_back((false, hello));
         Ok(Box::new(self.make_session(tx)))

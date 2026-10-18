@@ -160,6 +160,13 @@ pub struct RealityConfig {
     /// transparently relayed to. Empty disables the fallback (probes get silence).
     #[serde(default)]
     pub dest: String,
+    /// Server only: shape authenticated handshakes after the dest's real QUIC
+    /// handshake - the negotiated suite, the certificate's DER size and the
+    /// post-handshake session tickets - the way the reference implementation
+    /// pads every TLS record to the dest's length. Requires `dest`; a failed
+    /// probe falls back to the default handshake. On by default.
+    #[serde(default = "default_mimic_dest")]
+    pub mimic_dest: bool,
     /// Server only: accepted clock difference of the ClientHello timestamp.
     #[serde(default = "default_skew")]
     pub max_time_skew_secs: u64,
@@ -211,6 +218,10 @@ fn default_server_name() -> String {
 
 fn default_skew() -> u64 {
     60
+}
+
+fn default_mimic_dest() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +418,10 @@ short_id = "0123456789abcdef"
 server_name = "www.cloudflare.com"
 # Probes and other unauthenticated traffic are relayed (as UDP) to this real site.
 dest = "www.cloudflare.com:443"
+# Shape authenticated handshakes after the dest's real QUIC handshake (suite,
+# certificate size, session tickets). Set to false to always use the default
+# handshake instead. Requires `dest`.
+mimic_dest = true
 
 # Optional: throttle the decoy relay so a prober cannot use the real site as a
 # free amplifier. `after_bytes` pass freely, then the flow is held to

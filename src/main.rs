@@ -6,10 +6,12 @@ mod cid;
 mod client;
 mod config;
 mod initial;
+mod mimic;
 mod protocol;
 mod reality_socket;
 mod salamander;
 mod server;
+mod ticket;
 mod tls;
 mod util;
 

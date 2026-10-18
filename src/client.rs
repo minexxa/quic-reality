@@ -65,7 +65,10 @@ impl ConnManager {
             server_pub,
             short_id: parse_short_id(&cfg.reality.short_id)?,
             sni: cfg.reality.server_name.clone(),
-            transport: tls::make_transport(&cfg.quic),
+            // The client never probes the dest (it only ever talks to the
+            // REALITY server), so there is no flight to shape after: its
+            // transport parameters stay the browser-like defaults.
+            transport: tls::make_transport(&cfg.quic, None),
             conn: tokio::sync::Mutex::new(None),
         }))
     }
